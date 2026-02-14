@@ -116,12 +116,13 @@ def fetch_papers_by_topic(
 
 
 def store_debate(sb: SupabaseClient, result: DebateResult) -> dict:
-    """Insert a single debate result into the ``debates`` table."""
+    """Insert a single debate result into the ``debates`` table.
+
+    Links back to ``papers`` via the ``paper_id`` (FK → papers.id)
+    """
     v = result.verdict
-    paper_name = result.paper.get("paper_name") or result.paper.get("title", "")
     row = {
-        "paper_name": paper_name,
-        "paper_url": result.paper.get("url", ""),
+        "paper_id": result.paper.get("id"),  # FK → papers.id
         "topic": result.paper.get("topic", ""),
         "verdict": v.get("verdict", "UNCERTAIN"),
         "confidence": v.get("confidence", 0.0),
@@ -227,11 +228,12 @@ def get_promising(
     *,
     min_confidence: float = 0.6,
 ) -> list[dict]:
-    """Convenience: fetch debates marked PROMISING / INTERESTING."""
+    """Fetch debates marked PROMISING / INTERESTING, joined with paper data."""
     sb = _get_supabase()
+    # Supabase's foreign-key join syntax  "*, papers(*)" pulls in all columns from the related paper row via the paper_id FK
     query = (
         sb.table("debates")
-        .select("*")
+        .select("*, papers(*)")
         .in_("verdict", ["PROMISING", "INTERESTING"])
         .gte("confidence", min_confidence)
         .order("created_at", desc=True)
