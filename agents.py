@@ -137,7 +137,7 @@ def _format_paper(paper: dict[str, Any]) -> str:
     readable prompt block.
 
     Expected keys (from DB): paper_name, paper_authors (JSON list),
-    published (date string), summary, url, topic.
+    published (date string), summary, journal, fulltext, url, topic.
     Also tolerates the generic keys title/authors/abstract for testing.
     """
     title = paper.get("paper_name") or paper.get("title", "Unknown")
@@ -148,16 +148,22 @@ def _format_paper(paper: dict[str, Any]) -> str:
     date = paper.get("published") or paper.get("date", "")
     url = paper.get("url", "")
     topic = paper.get("topic", "")
+    journal = paper.get("journal", "")
+    fulltext = paper.get("fulltext", "")
 
     lines = [f"**Title:** {title}"]
     if authors:
         lines.append(f"**Authors:** {authors}")
+    if journal:
+        lines.append(f"**Journal:** {journal}")
     if date:
         lines.append(f"**Published:** {date}")
     if topic:
         lines.append(f"**Topic:** {topic}")
     if abstract:
         lines.append(f"**Summary:** {abstract}")
+    if fulltext:
+        lines.append(f"**Full Text:**\n{fulltext}")
     if url:
         lines.append(f"**URL:** {url}")
 
@@ -320,6 +326,8 @@ if __name__ == "__main__":
         "published": "2024-05-21",
         "url": "https://transformer-circuits.pub/2024/scaling-monosemanticity/",
         "topic": "mechanistic interpretability",
+        "journal": "Transformer Circuits Thread",
+        "fulltext": "",  # empty for demo, real papers will have this
     }
 
     result = run_debate(sample_paper, num_rounds=2, verbose=True)

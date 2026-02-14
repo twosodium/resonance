@@ -9,8 +9,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from supabase import create_client, Client as SupabaseClient
@@ -19,14 +21,27 @@ from agents import DebateResult, run_debate
 from scrapers import run_scraper  # abstract todo
 
 # ---------------------------------------------------------------------------
-# Config
+# Config — loaded from config.json (dashboard writes this file)
 # ---------------------------------------------------------------------------
+
+CONFIG_PATH = Path(__file__).parent / "config.json"
+
+def load_config() -> dict:
+    """Read config.json, falling back to sensible defaults."""
+    defaults = {"topic": "mechanistic interpretability", "multiplier": 3}
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+        return {**defaults, **cfg}
+    return defaults
+
+def save_config(cfg: dict) -> None:
+    """Persist config back to config.json (called by the dashboard later)."""
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # anon or service-role key
-
-# Hardcoded for now, later the user can pick this from the dashboard
-DEFAULT_TOPIC = os.getenv("DEBATE_TOPIC", "mechanistic interpretability")
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +72,7 @@ async def scrape_and_store(
 
     Returns the list of stored rows.
     """
-    topics = topics or [DEFAULT_TOPIC]
+    topics = topics or [load_config()["topic"]]
     sb = _get_supabase()
 
     print("🔍  Scraping papers …")
@@ -76,6 +91,8 @@ async def scrape_and_store(
             "paper_authors": p.get("paper_authors", p.get("authors", [])),
             "published": p.get("published", p.get("date", None)),
             "summary": p.get("summary", p.get("abstract", "")),
+            "journal": p.get("journal", ""),
+            "fulltext": p.get("fulltext", ""),
             "url": p.get("url", ""),
         })
 
@@ -140,21 +157,23 @@ def store_debate(sb: SupabaseClient, result: DebateResult) -> dict:
 
 
 def run_debate_pipeline(
-    topic: str = DEFAULT_TOPIC,
+    topic: str | None = None,
     *,
+    multiplier: int | None = None,
     debate_rounds: int = 3,
     limit: int = 50,
     verbose: bool = False,
 ) -> list[dict[str, Any]]:
     """
-    Pull papers for *topic* from the DB, debate each one, store verdicts.
+    Pull papers for *topic* from the DB, debate each one, store verdicts,
+    then return the top 1/multiplier papers ranked by confidence.
 
     Parameters
     ----------
-    topic : str
-        Only papers whose ``topic`` column matches (case-insensitive) will
-        be debated.  Hardcoded / env-var for now; the dashboard will let
-        the user pick later.
+    topic : str | None
+        Filter papers by topic.  ``None`` → reads from config.json.
+    multiplier : int | None
+        Return the top 1/*multiplier* fraction of debated papers.
     debate_rounds : int
         Number of Scout ↔ Advocate ↔ Skeptic loops per paper.
     limit : int
@@ -165,8 +184,11 @@ def run_debate_pipeline(
     Returns
     -------
     list[dict]
-        One entry per paper: ``{paper, verdict, debate_log, stored}``.
+        Top papers after the multiplier cut, sorted by confidence desc.
     """
+    cfg = load_config()
+    topic = topic or cfg["topic"]
+    multiplier = multiplier or cfg.get("multiplier", 3)
     sb = _get_supabase()
 
     # 1. Fetch papers for this topic -----------------------------------------
@@ -179,7 +201,7 @@ def run_debate_pipeline(
         return []
 
     # 2. Debate each paper ---------------------------------------------------
-    results: list[dict[str, Any]] = []
+    all_results: list[dict[str, Any]] = []
     for idx, paper in enumerate(papers, 1):
         name = paper.get("paper_name", "?")
         print(f"\n📄  [{idx}/{len(papers)}] Debating: {name}")
@@ -192,7 +214,7 @@ def run_debate_pipeline(
 
         # 3. Store verdict ----------------------------------------------------
         stored = store_debate(sb, debate_result)
-        results.append({
+        all_results.append({
             "paper": paper,
             "verdict": debate_result.verdict,
             "debate_log": debate_result.rounds,
@@ -209,43 +231,57 @@ def run_debate_pipeline(
         print(f"   {emoji} {v.get('verdict', '?')}  (confidence {v.get('confidence', '?')})")
         print(f"   → {v.get('one_liner', '')}")
 
-    # 4. Summary --------------------------------------------------------------
-    promising = [
-        r for r in results
-        if r["verdict"].get("verdict") in ("PROMISING", "INTERESTING")
-    ]
+    # 4. Apply multiplier — keep top 1/multiplier by confidence ---------------
+    all_results.sort(
+        key=lambda r: r["verdict"].get("confidence", 0.0),
+        reverse=True,
+    )
+    top_n = max(1, math.ceil(len(all_results) / multiplier))
+    top_results = all_results[:top_n]
+
     print(f"\n{'='*60}")
-    print(f"🎯  {len(promising)} / {len(results)} papers look promising")
-    for r in promising:
-        print(f"   • {r['paper'].get('paper_name')}")
+    print(f"🎯  Returning top {top_n} / {len(all_results)} papers (multiplier=1/{multiplier})")
+    for r in top_results:
+        c = r["verdict"].get("confidence", 0)
+        print(f"   • [{c:.2f}] {r['paper'].get('paper_name')}")
     print("=" * 60)
 
-    return results
+    return top_results
 
 
-def get_promising(
+def get_top_papers(
     topic: str | None = None,
     *,
-    min_confidence: float = 0.6,
+    multiplier: int | None = None,
 ) -> list[dict]:
-    """Fetch debates marked PROMISING / INTERESTING, joined with paper data."""
+    """Fetch the top 1/*multiplier* debates, joined with paper data.
+
+    Reads ``topic`` and ``multiplier`` from config.json when not provided.
+    """
+    cfg = load_config()
+    topic = topic or cfg["topic"]
+    multiplier = multiplier or cfg.get("multiplier", 3)
     sb = _get_supabase()
-    # Supabase's foreign-key join syntax  "*, papers(*)" pulls in all columns from the related paper row via the paper_id FK
+
+    # Pull all debates for this topic, ordered by confidence desc
     query = (
         sb.table("debates")
         .select("*, papers(*)")
-        .in_("verdict", ["PROMISING", "INTERESTING"])
-        .gte("confidence", min_confidence)
-        .order("created_at", desc=True)
-        .limit(50)
+        .order("confidence", desc=True)
     )
     if topic:
         query = query.ilike("topic", f"%{topic}%")
     resp = query.execute()
-    return resp.data if resp.data else []
+    rows = resp.data if resp.data else []
+
+    # Apply multiplier cut
+    top_n = max(1, math.ceil(len(rows) / multiplier)) if rows else 0
+    return rows[:top_n]
 
 
 if __name__ == "__main__":
+    cfg = load_config()
+
     parser = argparse.ArgumentParser(description="Research paper debate pipeline")
     parser.add_argument(
         "--scrape",
@@ -255,8 +291,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--topic",
         type=str,
-        default=DEFAULT_TOPIC,
-        help="Topic to scrape / debate (default: %(default)s).",
+        default=None,
+        help=f"Topic to scrape / debate (config.json default: {cfg['topic']}).",
+    )
+    parser.add_argument(
+        "--multiplier",
+        type=int,
+        default=None,
+        help=f"Return top 1/N papers (config.json default: {cfg.get('multiplier', 3)}).",
     )
     parser.add_argument(
         "--rounds",
@@ -279,11 +321,12 @@ if __name__ == "__main__":
 
     if args.scrape:
         # --- SCRAPE workflow ---
-        asyncio.run(scrape_and_store([args.topic]))
+        asyncio.run(scrape_and_store([args.topic] if args.topic else None))
     else:
         # --- DEBATE workflow ---
         results = run_debate_pipeline(
             topic=args.topic,
+            multiplier=args.multiplier,
             debate_rounds=args.rounds,
             limit=args.limit,
             verbose=args.verbose,
