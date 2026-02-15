@@ -40,6 +40,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupSidebarToggle();
   await loadDashboardSources();
   setupDashboardSourceToggles();
+  await loadDashboardModelAndDate();
+  setupDashboardModelAndDate();
 
   // Load real topics from DB
   await loadTopics();
@@ -150,6 +152,106 @@ function setupDashboardSourceToggles() {
   });
 }
 
+
+// ---------------------------------------------------------------------------
+// Dashboard model toggle & earliest-date (under search bar)
+// ---------------------------------------------------------------------------
+
+let _modelDateSaveTimer = null;
+
+async function loadDashboardModelAndDate() {
+  try {
+    const s = await getSettings();
+    const modelDeep = (s.filter_llm_model || '').includes('sonnet');
+    const fastRadio = document.getElementById('ds-model-fast');
+    const deepRadio = document.getElementById('ds-model-deep');
+    if (fastRadio) fastRadio.checked = !modelDeep;
+    if (deepRadio) deepRadio.checked = modelDeep;
+
+    const dateInput = document.getElementById('ds-earliest-date');
+    if (dateInput && s.earliest_date) dateInput.value = s.earliest_date.slice(0, 10);
+    // Highlight matching quick-date button
+    _highlightQuickDateBtn(s.earliest_date || '');
+  } catch (_) { /* best-effort */ }
+}
+
+function setupDashboardModelAndDate() {
+  // Model radios
+  ['ds-model-fast', 'ds-model-deep'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('change', () => {
+      clearTimeout(_modelDateSaveTimer);
+      _modelDateSaveTimer = setTimeout(saveModelAndDateNow, 400);
+    });
+  });
+  // Date input
+  const dateInput = document.getElementById('ds-earliest-date');
+  if (dateInput) dateInput.addEventListener('change', () => {
+    _highlightQuickDateBtn(dateInput.value || '');
+    clearTimeout(_modelDateSaveTimer);
+    _modelDateSaveTimer = setTimeout(saveModelAndDateNow, 400);
+  });
+}
+
+async function saveModelAndDateNow() {
+  const deepRadio = document.getElementById('ds-model-deep');
+  const dateInput = document.getElementById('ds-earliest-date');
+  const body = {
+    filter_llm_model: (deepRadio && deepRadio.checked) ? 'claude-sonnet-4-5' : 'claude-haiku-4-5',
+    earliest_date: (dateInput?.value || '').trim().slice(0, 10),
+  };
+  try { await putSettings(body); } catch (_) { /* best-effort */ }
+}
+
+/** Quick-select date buttons */
+function setQuickDate(btn, offset) {
+  const dateInput = document.getElementById('ds-earliest-date');
+  let dateStr = '';
+  if (offset) {
+    const now = new Date();
+    if (offset === '1m') now.setMonth(now.getMonth() - 1);
+    else if (offset === '3m') now.setMonth(now.getMonth() - 3);
+    else if (offset === '6m') now.setMonth(now.getMonth() - 6);
+    else if (offset === '1y') now.setFullYear(now.getFullYear() - 1);
+    else if (offset === '2y') now.setFullYear(now.getFullYear() - 2);
+    dateStr = now.toISOString().slice(0, 10);
+  }
+  if (dateInput) dateInput.value = dateStr;
+
+  // Highlight this button
+  document.querySelectorAll('.quick-date-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+
+  clearTimeout(_modelDateSaveTimer);
+  _modelDateSaveTimer = setTimeout(saveModelAndDateNow, 300);
+}
+
+function _highlightQuickDateBtn(dateStr) {
+  if (!dateStr) {
+    document.querySelectorAll('.quick-date-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.offset === '');
+    });
+    return;
+  }
+  // Find which offset matches
+  const d = new Date(dateStr + 'T00:00:00');
+  const now = new Date();
+  const diffMs = now - d;
+  const diffDays = diffMs / (1000 * 60 * 60 * 24);
+  let matchOffset = '';
+  if (Math.abs(diffDays - 30) < 5) matchOffset = '1m';
+  else if (Math.abs(diffDays - 90) < 10) matchOffset = '3m';
+  else if (Math.abs(diffDays - 180) < 15) matchOffset = '6m';
+  else if (Math.abs(diffDays - 365) < 20) matchOffset = '1y';
+  else if (Math.abs(diffDays - 730) < 30) matchOffset = '2y';
+  document.querySelectorAll('.quick-date-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.offset === matchOffset);
+  });
+}
+
+// Make setQuickDate globally accessible
+window.setQuickDate = setQuickDate;
+
 // ---------------------------------------------------------------------------
 // Sidebar
 // ---------------------------------------------------------------------------
@@ -232,9 +334,10 @@ async function startSearch(topic) {
   showLoading('Scraping papers from ' + (sourceNames.length ? sourceNames.join(', ') : 'sources') + '…');
   showCancelSearchButton(true);
 
-  // IMPORTANT: Flush source selection to config before triggering the pipeline
+  // IMPORTANT: Flush source, model, and date selection to config before triggering the pipeline
   clearTimeout(_sourceSaveTimer);
-  await saveSourcesNow();
+  clearTimeout(_modelDateSaveTimer);
+  await Promise.all([saveSourcesNow(), saveModelAndDateNow()]);
 
   try {
     await triggerSearch(topic);

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Dashboard — Papermint</title>
+  <title>Dashboard — Resonance</title>
   <link rel="icon" type="image/png" href="papermint_logo.png" />
   <link rel="stylesheet" href="styles.css" />
   <script src="theme.js"></script>
@@ -15,7 +15,7 @@
     <header class="dashboard-topbar">
       <div class="topbar-left">
         <button type="button" class="btn btn-ghost sidebar-toggle" id="sidebar-toggle" onclick="toggleSidebar()" title="Toggle menu">☰</button>
-        <a href="index.html" class="topbar-logo" style="text-decoration:none"><img src="papermint_logo.png" alt="" class="logo-icon" /> papermint</a>
+        <a href="index.html" class="topbar-logo" style="text-decoration:none"><img src="papermint_logo.png" alt="" class="logo-icon" /> resonance</a>
       </div>
       <div class="topbar-right">
         <div class="avatar-dropdown">
@@ -78,6 +78,27 @@
           <label class="source-chip"><input type="checkbox" id="ds-source-openalex" /> OpenAlex</label>
           <label class="source-chip"><input type="checkbox" id="ds-source-semantic_scholar" /> Semantic Scholar</label>
           <label class="source-chip"><input type="checkbox" id="ds-source-internet" /> Internet</label>
+        </div>
+        <div class="search-options-row" id="search-options-row">
+          <div class="search-option-group">
+            <span class="search-options-label">Model:</span>
+            <label class="source-chip model-chip" title="Fast (Claude Haiku)">
+              <input type="radio" name="ds-model" id="ds-model-fast" value="fast" checked /> Fast
+            </label>
+            <label class="source-chip model-chip" title="Deep (Claude Sonnet)">
+              <input type="radio" name="ds-model" id="ds-model-deep" value="deep" /> Deep
+            </label>
+          </div>
+          <div class="search-option-group">
+            <span class="search-options-label">Since:</span>
+            <button type="button" class="quick-date-btn" data-offset="1m" onclick="setQuickDate(this,'1m')">1 mo</button>
+            <button type="button" class="quick-date-btn" data-offset="3m" onclick="setQuickDate(this,'3m')">3 mo</button>
+            <button type="button" class="quick-date-btn" data-offset="6m" onclick="setQuickDate(this,'6m')">6 mo</button>
+            <button type="button" class="quick-date-btn" data-offset="1y" onclick="setQuickDate(this,'1y')">1 yr</button>
+            <button type="button" class="quick-date-btn" data-offset="2y" onclick="setQuickDate(this,'2y')">2 yr</button>
+            <button type="button" class="quick-date-btn active" data-offset="" onclick="setQuickDate(this,'')">Any</button>
+            <input type="date" id="ds-earliest-date" class="ds-date-input" title="Earliest publication date" />
+          </div>
         </div>
         <span class="search-hint">Press Enter to explore a topic</span>
       </div>
