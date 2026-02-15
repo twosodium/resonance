@@ -5,7 +5,8 @@
   "top_k": 5,
   "debate_rounds": 1,
   "sources": [
-    "biorxiv"
+    "biorxiv",
+    "semantic_scholar"
   ],
   "skip_browserbase": false,
   "anthropic_api_key": "",

@@ -23,6 +23,7 @@ import json
 import logging
 import concurrent.futures
 import os
+import threading
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -265,11 +266,14 @@ def run_debate_pipeline(
     debate_rounds: int = 2,
     limit: int = 50,
     verbose: bool = False,
-    on_phase: Callable[[str], None] | None = None,
+    on_phase: Callable[..., None] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Pull papers for *topic* from the DB, debate each one **in parallel**,
     store verdicts, and return all results sorted by confidence.
+
+    ``on_phase`` is called with ``("debating", debated=N, total_papers=M)``
+    after each paper finishes so callers can track progress.
     """
     cfg = load_config()
     topic = topic or cfg["topic"]
@@ -284,18 +288,21 @@ def run_debate_pipeline(
         logger.info("Nothing to debate — run the scraper first, or check your topic.")
         return []
 
+    total_papers = len(papers)
     if on_phase:
-        on_phase("debating")
+        on_phase("debating", debated=0, total_papers=total_papers)
 
     # 2. Debate papers in parallel -------------------------------------------
     from anthropic import Anthropic as _Anthropic
 
     shared_client = _Anthropic()
+    _debated_counter = {"n": 0}
+    _counter_lock = threading.Lock()
 
     def _debate_one(idx_paper: tuple[int, dict]) -> dict[str, Any]:
         idx, paper = idx_paper
         name = paper.get("paper_name", "?")
-        logger.info("[%d/%d] Debating: %s", idx, len(papers), name)
+        logger.info("[%d/%d] Debating: %s", idx, total_papers, name)
 
         debate_result = run_debate(
             paper,
@@ -315,6 +322,13 @@ def run_debate_pipeline(
         }.get(v.get("verdict", ""), "⚪")
         logger.info("  %s %s  (confidence %.2f)", emoji, v.get("verdict", "?"), v.get("confidence", 0))
 
+        # Report progress
+        with _counter_lock:
+            _debated_counter["n"] += 1
+            done = _debated_counter["n"]
+        if on_phase:
+            on_phase("debating", debated=done, total_papers=total_papers)
+
         return {
             "paper": paper,
             "verdict": debate_result.verdict,
@@ -322,7 +336,7 @@ def run_debate_pipeline(
             "stored": stored,
         }
 
-    max_workers = min(8, len(papers))
+    max_workers = min(16, len(papers))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         all_results = list(pool.map(_debate_one, enumerate(papers, 1)))
 
@@ -343,8 +357,9 @@ def full_pipeline(
     candidate_count: int | None = None,
     top_k: int | None = None,
     debate_rounds: int | None = None,
+    sources: list[str] | None = None,
     verbose: bool = False,
-    on_phase: Callable[[str], None] | None = None,
+    on_phase: Callable[..., None] | None = None,
     summarize_query: bool = True,
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any] | None:
@@ -352,13 +367,15 @@ def full_pipeline(
     Run the complete pipeline: (1) Optionally summarize user query to short topic.
     (2) Scrape papers (fast path: API-only, no browser) and store in DB.
     (3) Debate each paper. Return summary counts.
+
+    *sources* overrides config.json if provided.
     """
     cfg = load_config()
     candidate_count = candidate_count or cfg.get("candidate_count", 8)
     top_k = top_k or cfg.get("top_k", 5)
     debate_rounds = debate_rounds or cfg.get("debate_rounds", 2)
-    fast = os.environ.get("SKIP_BROWSERBASE", "") in ("1", "true", "yes") or True
-    sources = cfg.get("sources")
+    fast = os.environ.get("SKIP_BROWSERBASE", "") in ("1", "true", "yes") or cfg.get("skip_browserbase", False)
+    sources = sources or cfg.get("sources")
 
     if summarize_query and (len(topic) > 80 or "\n" in topic or topic.count(".") >= 1):
         search_topic = summarize_query_to_topic(topic)

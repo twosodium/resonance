@@ -152,7 +152,7 @@ def search():
                 topic=topic,
                 user_id=user_id,
                 user_context=user_ctx,
-                on_phase=lambda phase: _set_job(job_key, phase),
+                on_phase=lambda phase, **kw: _set_job(job_key, phase, **kw),
                 cancel_check=cancel_check,
             )
             with _jobs_lock:
@@ -523,13 +523,21 @@ def ideas_mindmap():
         items.append({"id": str(idea_id), "title": name, "one_liner": oneliner})
 
     prompt = (
-        "You are given a list of research ideas (papers). For each pair that are clearly related by theme, method, or domain, "
-        "output one edge with a short 'similarity topic' (1-5 words) describing what they have in common. "
-        "Do not relate every idea to every other; only include meaningful connections. "
-        "Return valid JSON only, no markdown, in this exact format: "
-        '{"edges": [{"from_id": "<id>", "to_id": "<id>", "label": "<similarity topic>"}, ...]}'
+        "You are given a list of research ideas/papers. "
+        "For each pair that shares a deeper intellectual connection, output one edge. "
+        "The label should describe the SPECIFIC conceptual bridge or overlap between them in at most 7 words — "
+        "for example 'shared attention mechanism', 'both target protein misfolding', 'complementary imaging modalities'. "
+        "Do NOT use the search topic name as the label. Be creative, specific, and concise (≤7 words per label). "
+        "Only include genuinely meaningful connections (not every pair). "
+        "Return valid JSON only, no markdown fences, in this exact format:\n"
+        '{"edges": [{"from_id": "<id>", "to_id": "<id>", "label": "<specific conceptual bridge>"}, ...]}'
         "\n\nIdeas:\n"
-        + "\n".join(f"- id={it['id']} | {it['title']}" + (f" | {it['one_liner']}" if it.get("one_liner") else "") for it in items)
+        + "\n".join(
+            f"- id={it['id']} | {it['title']}"
+            + (f" | {it['one_liner']}" if it.get("one_liner") else "")
+            + (f" | topic={idea.get('topic','')}" if (idea := ideas[i] if i < len(ideas) else {}).get("topic") else "")
+            for i, it in enumerate(items)
+        )
     )
 
     try:

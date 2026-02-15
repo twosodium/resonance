@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Ideas — Papermint</title>
+  <link rel="icon" type="image/png" href="papermint_logo.png" />
   <link rel="stylesheet" href="styles.css" />
   <script src="theme.js"></script>
 </head>
@@ -13,10 +14,10 @@
     <!-- ===== TOP BAR ===== -->
     <header class="dashboard-topbar">
       <div class="topbar-left">
-        <a href="index.html" class="topbar-logo" style="text-decoration:none">◆ papermint</a>
+        <button type="button" class="btn btn-ghost sidebar-toggle" id="sidebar-toggle" onclick="toggleSidebar()" title="Toggle menu">☰</button>
+        <a href="index.html" class="topbar-logo" style="text-decoration:none"><img src="papermint_logo.png" alt="" class="logo-icon" /> papermint</a>
       </div>
       <div class="topbar-right">
-        <a href="dashboard.html" class="btn btn-ghost">← Dashboard</a>
         <div class="avatar-dropdown">
           <button type="button" class="avatar avatar-btn" id="avatar" onclick="toggleAvatarMenu()" title="Account">?</button>
           <div class="avatar-menu" id="avatar-menu">
@@ -27,15 +28,21 @@
       </div>
     </header>
 
-    <!-- ===== SIDEBAR ===== -->
-    <aside class="dashboard-sidebar">
+    <!-- ===== SIDEBAR (mirrors dashboard) ===== -->
+    <aside class="dashboard-sidebar" id="dashboard-sidebar">
       <div class="sidebar-item" onclick="window.location='dashboard.html'">
-        <span class="icon">←</span> Dashboard
+        <span class="icon">+</span> New search
       </div>
+      <div class="sidebar-label">Previous topics</div>
+      <div id="sidebar-topics"><!-- filled by JS --></div>
       <div class="sidebar-spacer"></div>
       <div class="sidebar-label">Explore</div>
       <div class="sidebar-item active">
         <span class="icon">✦</span> Top Ideas
+      </div>
+      <div class="sidebar-label">Settings</div>
+      <div class="sidebar-item" onclick="window.location='settings.html'">
+        <span class="icon">⚙</span> Preferences
       </div>
     </aside>
 
@@ -53,6 +60,9 @@
           <span>Loading ideas…</span>
         </div>
       </div>
+
+      <!-- Topic legend -->
+      <div id="ideas-legend" class="ideas-legend" style="display:none"></div>
 
       <!-- Tooltip (follows mouse) -->
       <div class="idea-tooltip" id="idea-tooltip">
@@ -79,6 +89,11 @@
       window.location.href = 'index.html';
     }
 
+    function toggleSidebar() {
+      const dash = document.querySelector('.dashboard');
+      if (dash) dash.classList.toggle('sidebar-collapsed');
+    }
+
     (async () => {
       const user = await requireAuth();
       if (!user) return;
@@ -87,8 +102,30 @@
       const name = profile?.first_name || user.email?.split('@')[0] || '?';
       document.getElementById('avatar').textContent = name.charAt(0).toUpperCase();
 
+      // Populate sidebar topics
+      await loadSidebarTopics();
+
       await loadIdeas();
     })();
+
+    async function loadSidebarTopics() {
+      try {
+        const topics = await fetchTopics();
+        const container = document.getElementById('sidebar-topics');
+        if (!container) return;
+        if (!topics || topics.length === 0) {
+          container.innerHTML = '<div class="sidebar-empty">No topics yet</div>';
+          return;
+        }
+        container.innerHTML = topics.map(t =>
+          `<div class="sidebar-item" onclick="window.location='dashboard.html#topic=${encodeURIComponent(t.topic)}'">
+            <span class="icon">◇</span> ${t.topic}
+          </div>`
+        ).join('');
+      } catch (e) {
+        console.warn('Failed to load sidebar topics:', e);
+      }
+    }
 
     async function loadIdeas() {
       const user = await getUser();
@@ -137,48 +174,237 @@
         console.warn('Mindmap edges failed:', e);
       }
       renderMindmap(edges);
+      renderLegend();
     }
 
-    let nodePositions = {};
+    function renderLegend() {
+      const el = document.getElementById('ideas-legend');
+      if (!el) return;
+      // Collect unique topics already colored
+      const topicSet = [...new Set(allIdeas.map(d => d.topic || 'Unknown'))];
+      if (topicSet.length < 2) { el.style.display = 'none'; return; }
+      el.style.display = 'flex';
+      el.innerHTML = topicSet.map(t =>
+        `<span class="legend-chip"><span class="legend-dot" style="background:${topicColor(t)}"></span>${t}</span>`
+      ).join('');
+    }
+
+    // ── Mindmap state ──
+    let nodes = [];          // [{id, x, y, vx, vy, el, idea}]
     let mindmapEdges = [];
     let dragNode = null;
+    let didDrag = false;
     let dragOffset = { x: 0, y: 0 };
+    let physicsRAF = null;
+
+    const MIN_NODE = 40;          // smallest circle (0% confidence)
+    const MAX_NODE = 160;         // biggest circle (100% confidence)
+    const DAMPING = 0.88;
+    const REPEL_FORCE = 4000;
+    const EDGE_SPRING = 0.005;
+    const CENTER_PULL = 0.002;
+
+    // Deterministic color per topic string
+    const _topicColors = {};
+    const PALETTE = [
+      '#6366f1', '#ec4899', '#f59e0b', '#10b981', '#3b82f6',
+      '#8b5cf6', '#ef4444', '#14b8a6', '#f97316', '#06b6d4',
+      '#a855f7', '#22c55e', '#e11d48', '#0ea5e9', '#d946ef',
+      '#84cc16', '#f43f5e', '#2dd4bf', '#fb923c', '#818cf8',
+    ];
+    let _colorIdx = 0;
+    function topicColor(topic) {
+      if (!topic) return PALETTE[0];
+      if (!_topicColors[topic]) {
+        _topicColors[topic] = PALETTE[_colorIdx % PALETTE.length];
+        _colorIdx++;
+      }
+      return _topicColors[topic];
+    }
+    function nodeSize(confidence) {
+      const t = Math.max(0, Math.min(1, confidence || 0));
+      // Exponential curve for more dramatic size difference
+      const curved = t * t;
+      return MIN_NODE + curved * (MAX_NODE - MIN_NODE);
+    }
 
     function renderMindmap(edges) {
       mindmapEdges = edges;
+      if (physicsRAF) cancelAnimationFrame(physicsRAF);
+
       const container = document.getElementById('ideas-container');
       container.innerHTML = '';
       const W = container.offsetWidth || 900;
-      const H = Math.max(container.offsetHeight || 500, 400);
+      const H = Math.max(container.offsetHeight || 500, 500);
       const centerX = W / 2;
       const centerY = H / 2;
-      const radius = Math.min(W, H) * 0.38;
+      const radius = Math.min(W, H) * 0.32;
       const N = allIdeas.length;
 
-      const nodeSize = 56;
-
-      allIdeas.forEach((idea, i) => {
-        const id = String(idea.id);
-        const angle = (2 * Math.PI * i) / N - Math.PI / 2;
-        const x = centerX + radius * Math.cos(angle);
-        const y = centerY + radius * Math.sin(angle);
-        nodePositions[id] = { x, y };
-      });
-
+      // ── SVG for edges ──
       const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
       svg.setAttribute('class', 'mindmap-svg');
       svg.setAttribute('width', '100%');
       svg.setAttribute('height', '100%');
-      svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      svg.style.position = 'absolute';
+      svg.style.top = '0';
+      svg.style.left = '0';
+      svg.style.pointerEvents = 'none';
       container.appendChild(svg);
 
+      const gEdges = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+      gEdges.setAttribute('class', 'edges');
+      svg.appendChild(gEdges);
+
+      // ── Create node objects ──
+      nodes = [];
+      allIdeas.forEach((idea, i) => {
+        const id = String(idea.id);
+        const paper = idea.papers || {};
+        const conf = idea.confidence || 0;
+        const topic = idea.topic || '';
+        const sz = nodeSize(conf);
+        const color = topicColor(topic);
+
+        // Spread in a circle initially
+        const angle = (2 * Math.PI * i) / N - Math.PI / 2;
+        const x = centerX + radius * Math.cos(angle) + (Math.random() - 0.5) * 20;
+        const y = centerY + radius * Math.sin(angle) + (Math.random() - 0.5) * 20;
+
+        // DOM element
+        const el = document.createElement('div');
+        el.className = 'idea-node idea-blob';
+        el.dataset.id = id;
+        el.style.width = sz + 'px';
+        el.style.height = sz + 'px';
+
+        const title = paper.paper_name || topic || 'Unknown';
+        const shortTitle = title.length > 32 ? title.slice(0, 29) + '…' : title;
+        el.innerHTML =
+          `<div class="blob-circle" style="background:${color}"><span class="blob-verdict">${Math.round(conf * 100)}%</span></div>` +
+          `<span class="blob-title">${shortTitle}</span>`;
+
+        // Events
+        el.addEventListener('mouseenter', e => showTooltip(e, idea));
+        el.addEventListener('mousemove', moveTooltip);
+        el.addEventListener('mouseleave', hideTooltip);
+        el.addEventListener('click', () => {
+          if (!didDrag) {
+            window.open(`dashboard.html#topic=${encodeURIComponent(topic)}`, '_blank');
+          }
+        });
+        el.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          didDrag = false;
+          dragNode = id;
+          const nd = nodes.find(n => n.id === id);
+          const rect = container.getBoundingClientRect();
+          dragOffset.x = (e.clientX - rect.left) - (nd ? nd.x : x);
+          dragOffset.y = (e.clientY - rect.top) - (nd ? nd.y : y);
+        });
+
+        container.appendChild(el);
+
+        nodes.push({ id, x, y, vx: 0, vy: 0, el, idea, size: sz });
+      });
+
+      // ── Mouse handlers for dragging (attach once) ──
+      if (!renderMindmap._listenersAttached) {
+        renderMindmap._listenersAttached = true;
+        document.addEventListener('mousemove', (e) => {
+          if (!dragNode) return;
+          didDrag = true;
+          const container2 = document.getElementById('ideas-container');
+          if (!container2) return;
+          const rect = container2.getBoundingClientRect();
+          const nd = nodes.find(n => n.id === dragNode);
+          if (!nd) return;
+          nd.x = (e.clientX - rect.left) - dragOffset.x;
+          nd.y = (e.clientY - rect.top) - dragOffset.y;
+          nd.vx = 0;
+          nd.vy = 0;
+        });
+        document.addEventListener('mouseup', () => {
+          dragNode = null;
+        });
+      }
+
+      // ── Edge lookup for spring forces ──
+      const edgePairs = new Set();
+      mindmapEdges.forEach(e => {
+        edgePairs.add(`${e.from_id}:${e.to_id}`);
+        edgePairs.add(`${e.to_id}:${e.from_id}`);
+      });
+
+      // ── Physics loop ──
+      function tick() {
+        for (let i = 0; i < nodes.length; i++) {
+          const a = nodes[i];
+          if (a.id === dragNode) continue;
+          const aHalf = a.size / 2;
+
+          // Pull toward center
+          a.vx += (centerX - a.x) * CENTER_PULL;
+          a.vy += (centerY - a.y) * CENTER_PULL;
+
+          // Repel from other nodes (scaled by combined radii)
+          for (let j = 0; j < nodes.length; j++) {
+            if (i === j) continue;
+            const b = nodes[j];
+            let dx = a.x - b.x;
+            let dy = a.y - b.y;
+            const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+            const minDist = (a.size + b.size) * 1.2;
+            if (dist < minDist) {
+              const force = REPEL_FORCE / (dist * dist);
+              a.vx += (dx / dist) * force;
+              a.vy += (dy / dist) * force;
+            }
+          }
+
+          // Spring toward connected nodes
+          for (let j = 0; j < nodes.length; j++) {
+            if (i === j) continue;
+            const b = nodes[j];
+            if (!edgePairs.has(`${a.id}:${b.id}`)) continue;
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+            const ideal = (a.size + b.size) * 1.5;
+            a.vx += dx * EDGE_SPRING * (dist - ideal) / dist;
+            a.vy += dy * EDGE_SPRING * (dist - ideal) / dist;
+          }
+
+          // Dampen
+          a.vx *= DAMPING;
+          a.vy *= DAMPING;
+          a.x += a.vx;
+          a.y += a.vy;
+
+          // Bounce off walls
+          if (a.x < aHalf)      { a.x = aHalf;      a.vx = Math.abs(a.vx) * 0.5; }
+          if (a.x > W - aHalf)  { a.x = W - aHalf;  a.vx = -Math.abs(a.vx) * 0.5; }
+          if (a.y < aHalf)      { a.y = aHalf;      a.vy = Math.abs(a.vy) * 0.5; }
+          if (a.y > H - aHalf)  { a.y = H - aHalf;  a.vy = -Math.abs(a.vy) * 0.5; }
+        }
+
+        // Update DOM positions
+        nodes.forEach(n => {
+          const h = n.size / 2;
+          n.el.style.left = (n.x - h) + 'px';
+          n.el.style.top = (n.y - h) + 'px';
+        });
+
+        // Redraw SVG edges
+        redrawEdges();
+        physicsRAF = requestAnimationFrame(tick);
+      }
+
       function redrawEdges() {
-        const g = svg.querySelector('g.edges');
-        if (!g) return;
-        g.innerHTML = '';
+        gEdges.innerHTML = '';
         mindmapEdges.forEach(e => {
-          const from = nodePositions[String(e.from_id)];
-          const to = nodePositions[String(e.to_id)];
+          const from = nodes.find(n => n.id === String(e.from_id));
+          const to = nodes.find(n => n.id === String(e.to_id));
           if (!from || !to) return;
           const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
           line.setAttribute('x1', from.x);
@@ -186,73 +412,20 @@
           line.setAttribute('x2', to.x);
           line.setAttribute('y2', to.y);
           line.setAttribute('class', 'mindmap-edge');
-          g.appendChild(line);
+          gEdges.appendChild(line);
           const midX = (from.x + to.x) / 2;
           const midY = (from.y + to.y) / 2;
           const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
           label.setAttribute('x', midX);
-          label.setAttribute('y', midY);
+          label.setAttribute('y', midY - 4);
           label.setAttribute('text-anchor', 'middle');
           label.setAttribute('class', 'mindmap-edge-label');
-          label.textContent = (e.label || 'related').slice(0, 20);
-          g.appendChild(label);
+          label.textContent = e.label || '';
+          gEdges.appendChild(label);
         });
       }
 
-      const gEdges = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-      gEdges.setAttribute('class', 'edges');
-      svg.appendChild(gEdges);
-      redrawEdges();
-
-      allIdeas.forEach((idea, i) => {
-        const paper = idea.papers || {};
-        const id = String(idea.id);
-        const conf = idea.confidence || 0;
-        const verdict = (idea.verdict || 'uncertain').toLowerCase();
-        const pos = nodePositions[id];
-        const nodeEl = document.createElement('div');
-        nodeEl.className = `idea-node idea-blob ${verdict}`;
-        nodeEl.dataset.id = id;
-        nodeEl.style.width = nodeSize + 'px';
-        nodeEl.style.height = nodeSize + 'px';
-        nodeEl.style.left = (pos.x - nodeSize / 2) + 'px';
-        nodeEl.style.top = (pos.y - nodeSize / 2) + 'px';
-        const title = paper.paper_name || idea.topic || 'Unknown';
-        const shortTitle = title.length > 24 ? title.slice(0, 21) + '…' : title;
-        nodeEl.innerHTML = `<span class="blob-title">${shortTitle}</span><span class="blob-verdict">${Math.round(conf * 100)}%</span>`;
-
-        nodeEl.addEventListener('mouseenter', e => showTooltip(e, idea));
-        nodeEl.addEventListener('mousemove', moveTooltip);
-        nodeEl.addEventListener('mouseleave', hideTooltip);
-        nodeEl.addEventListener('click', (e) => { if (!dragNode) window.location = `dashboard.html#topic=${encodeURIComponent(idea.topic || '')}`; });
-
-        nodeEl.addEventListener('mousedown', (e) => {
-          e.preventDefault();
-          dragNode = id;
-          const rect = container.getBoundingClientRect();
-          dragOffset.x = (e.clientX - rect.left) - pos.x;
-          dragOffset.y = (e.clientY - rect.top) - pos.y;
-        });
-
-        container.appendChild(nodeEl);
-      });
-
-      const onMove = (e) => {
-        if (!dragNode) return;
-        const rect = container.getBoundingClientRect();
-        const x = (e.clientX - rect.left) - dragOffset.x;
-        const y = (e.clientY - rect.top) - dragOffset.y;
-        nodePositions[dragNode].x = x;
-        nodePositions[dragNode].y = y;
-        const el = container.querySelector(`[data-id="${dragNode}"]`);
-        if (el) {
-          el.style.left = (x - nodeSize / 2) + 'px';
-          el.style.top = (y - nodeSize / 2) + 'px';
-        }
-        redrawEdges();
-      };
-      document.addEventListener('mousemove', onMove);
-      document.addEventListener('mouseup', () => { dragNode = null; });
+      physicsRAF = requestAnimationFrame(tick);
     }
 
     function showTooltip(e, idea) {
@@ -283,7 +456,7 @@
     }
 
     window.addEventListener('resize', () => {
-      if (allIdeas.length > 0 && mindmapEdges.length >= 0) renderMindmap(mindmapEdges);
+      if (allIdeas.length > 0) renderMindmap(mindmapEdges);
     });
   </script>
 </body>

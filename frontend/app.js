@@ -121,22 +121,30 @@ function getEnabledSourceNames() {
     .map(name => labels[name] || name);
 }
 
+function getEnabledSourceIds() {
+  return DASHBOARD_SOURCE_IDS.filter(name => {
+    const cb = document.getElementById('ds-source-' + name);
+    return cb && cb.checked;
+  });
+}
+
+/** Save current source checkboxes to config.json and return immediately. */
+async function saveSourcesNow() {
+  const sources = getEnabledSourceIds();
+  try {
+    await putSettings({ sources: sources.length ? sources : DASHBOARD_SOURCE_IDS });
+  } catch (_) { /* best-effort */ }
+}
+
 function setupDashboardSourceToggles() {
   const el = document.getElementById('search-sources');
   if (!el) return;
-  function saveSources() {
-    const sources = DASHBOARD_SOURCE_IDS.filter(name => {
-      const cb = document.getElementById('ds-source-' + name);
-      return cb && cb.checked;
-    });
-    putSettings({ sources: sources.length ? sources : DASHBOARD_SOURCE_IDS }).catch(() => {});
-  }
   DASHBOARD_SOURCE_IDS.forEach(name => {
     const cb = document.getElementById('ds-source-' + name);
     if (cb) {
       cb.addEventListener('change', () => {
         clearTimeout(_sourceSaveTimer);
-        _sourceSaveTimer = setTimeout(saveSources, 400);
+        _sourceSaveTimer = setTimeout(saveSourcesNow, 400);
       });
     }
   });
@@ -224,6 +232,10 @@ async function startSearch(topic) {
   showLoading('Scraping papers from ' + (sourceNames.length ? sourceNames.join(', ') : 'sources') + '…');
   showCancelSearchButton(true);
 
+  // IMPORTANT: Flush source selection to config before triggering the pipeline
+  clearTimeout(_sourceSaveTimer);
+  await saveSourcesNow();
+
   try {
     await triggerSearch(topic);
   } catch (err) {
@@ -293,7 +305,9 @@ async function pollOnce(topic) {
     const sourceNames = getEnabledSourceNames();
     showLoading(`Scraping from ${sourceNames.length ? sourceNames.join(', ') : 'sources'}… ${papers.length} found so far`);
   } else if (phase === 'debating') {
-    showLoading(`Debating papers… ${debates.length}/${papers.length} analysed`);
+    const debated = status.debated ?? debates.length;
+    const total   = status.total_papers ?? papers.length;
+    showLoading(`Debating papers… ${debated}/${total} analysed`);
   } else if (phase === 'complete' || phase === 'error' || phase === 'cancelled') {
     hideLoading();
     stopPolling();

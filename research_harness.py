@@ -1608,7 +1608,10 @@ def run_harness(
     """
     user_sources = sources if sources is not None else ALL_SOURCES
     if fast:
-        enabled = (user_sources & FAST_SOURCES) or FAST_SOURCES
+        # In fast mode we use fewer rounds / candidates, but honour the
+        # user's source selection exactly — don't silently replace it with
+        # only the API-based sources.
+        enabled = user_sources if user_sources else FAST_SOURCES
         candidate_count = min(candidate_count, 20)
         max_rounds = 1
         skip_direct_filter = True

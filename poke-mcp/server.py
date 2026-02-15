@@ -123,6 +123,15 @@ mcp = FastMCP(
         "- Do NOT invent URLs, links, or authentication pages. There is NO external auth URL.\n"
         "- The ONLY way to link is with a token from the Papermint Settings page.\n"
         "- Wait for the user to provide the token, then call `link_account(token)`.\n\n"
+        "RESEARCH WORKFLOW:\n"
+        "- When the user asks you to research a topic, call `research_topic(topic)`. "
+        "It runs in the background.\n"
+        "- After starting research, PROACTIVELY call `check_research_status(topic)` "
+        "after about 60-90 seconds to see if it's done.\n"
+        "- When research is complete, `check_research_status` returns the top results "
+        "with paper links — share these with the user immediately.\n"
+        "- Results from Poke queries are automatically saved to the user's Papermint "
+        "dashboard — mention this so they know.\n\n"
         "OTHER RULES:\n"
         "- NEVER make up or assume any data. Only report what tools actually return.\n"
         "- NEVER invent URLs or links. If you don't know a URL, say so.\n"
@@ -260,11 +269,14 @@ def whoami() -> str:
 #  Tool 1 — Search & Debate (non-blocking — starts in background)
 # =====================================================================
 
-def _run_pipeline_bg(job_key: str, topic: str, user_id: str | None, user_ctx: str, cfg: dict):
+ALL_SOURCES = ["arxiv", "openalex", "semantic_scholar", "biorxiv", "internet"]
+
+
+def _run_pipeline_bg(job_key: str, topic: str, user_id: str | None, user_ctx: str, cfg: dict, sources: list[str] | None = None):
     """Background thread that runs the full pipeline and updates _bg_jobs."""
     try:
         _bg_jobs[job_key]["phase"] = "scraping"
-        logger.info("    [bg] Starting pipeline for %r", topic)
+        logger.info("    [bg] Starting pipeline for %r  sources=%s", topic, sources)
 
         from pipeline import full_pipeline
         result = full_pipeline(
@@ -274,13 +286,18 @@ def _run_pipeline_bg(job_key: str, topic: str, user_id: str | None, user_ctx: st
             candidate_count=cfg.get("candidate_count", 5),
             top_k=cfg.get("top_k", 5),
             debate_rounds=cfg.get("debate_rounds", 2),
+            sources=sources,
         )
+
+        # Fetch the top results so we can include them when the user checks status
+        top_summary = _fetch_top_results_summary(topic, user_id, limit=5)
 
         _bg_jobs[job_key] = {
             "status": "done",
             "phase": "complete",
             "papers_count": result.get("papers_count", 0),
             "debates_count": result.get("debates_count", 0),
+            "top_results": top_summary,
         }
         logger.info("    [bg] ✅ Pipeline complete: papers=%s debates=%s",
                      result.get("papers_count"), result.get("debates_count"))
@@ -289,27 +306,88 @@ def _run_pipeline_bg(job_key: str, topic: str, user_id: str | None, user_ctx: st
         _bg_jobs[job_key] = {"status": "error", "phase": "failed", "error": str(e)}
 
 
+def _fetch_top_results_summary(topic: str, user_id: str | None, limit: int = 5) -> str:
+    """Build a readable summary of the top debate results for a topic."""
+    try:
+        from pipeline import _get_supabase
+        sb = _get_supabase()
+
+        query = (
+            sb.table("debates")
+            .select("*, papers(*)")
+            .eq("topic", topic)
+            .order("confidence", desc=True)
+            .limit(limit)
+        )
+        if user_id:
+            query = query.eq("user_id", user_id)
+
+        resp = query.execute()
+        rows = resp.data or []
+        if not rows:
+            return "No debate results found."
+
+        lines = []
+        for i, row in enumerate(rows, 1):
+            paper = row.get("papers") or {}
+            verdict = row.get("verdict", "?")
+            conf = row.get("confidence", 0)
+            emoji = {"PROMISING": "🟢", "INTERESTING": "🟡", "UNCERTAIN": "🟠", "WEAK": "🔴"}.get(verdict, "⚪")
+
+            lines.append(f"{i}. {emoji} **{paper.get('paper_name', 'Unknown')}**")
+            lines.append(f"   Verdict: {verdict} · Confidence: {conf:.0%}")
+            if row.get("one_liner"):
+                lines.append(f"   → {row['one_liner']}")
+
+            strengths = row.get("key_strengths")
+            if strengths:
+                if isinstance(strengths, str):
+                    try:
+                        strengths = json.loads(strengths)
+                    except json.JSONDecodeError:
+                        strengths = []
+                if strengths:
+                    lines.append(f"   Strengths: {'; '.join(str(s) for s in strengths[:3])}")
+
+            if paper.get("url"):
+                lines.append(f"   🔗 {paper['url']}")
+            lines.append("")
+
+        return "\n".join(lines)
+    except Exception as e:
+        logger.warning("_fetch_top_results_summary failed: %s", e)
+        return f"(Could not fetch results: {e})"
+
+
 @mcp.tool()
-def research_topic(topic: str) -> str:
+def research_topic(topic: str, sources: str = "") -> str:
     """
     Search for research papers on a topic, then run a multi-agent debate
     (Scout, Advocate, Skeptic, Moderator) on each paper to evaluate its
     promise.
 
+    By default all available sources are used (arXiv, OpenAlex, Semantic
+    Scholar, bioRxiv, internet).  You can restrict to specific sources by
+    passing a comma-separated list.
+
     This kicks off the pipeline in the background and returns immediately.
-    Use `check_research_status(topic)` to check progress, then
-    `get_results(topic)` to see the verdicts once complete.
+    Use `check_research_status(topic)` to check progress — once done it
+    will include the top ranked results automatically.
+
+    Results are also saved to the user's Papermint dashboard.
 
     Requires a linked account.
 
     Args:
         topic: The research topic to investigate (e.g. "CRISPR gene editing",
                "mechanistic interpretability", "room-temperature superconductors")
+        sources: Optional comma-separated list of sources to use.  Defaults
+                 to all: "arxiv,openalex,semantic_scholar,biorxiv,internet"
 
     Returns:
         Confirmation that the search has started (it runs in the background).
     """
-    logger.info(">>> research_topic called  topic=%r", topic)
+    logger.info(">>> research_topic called  topic=%r  sources=%r", topic, sources)
 
     err = _require_linked("research_topic")
     if err:
@@ -328,23 +406,31 @@ def research_topic(topic: str) -> str:
         phase = existing.get("phase", "working")
         return f"⏳ Already researching \"{topic}\" (currently {phase}). Use `check_research_status(\"{topic}\")` to check progress."
 
-    logger.info("    Starting background pipeline  user_id=%s", user_id)
+    # Parse sources — default to ALL
+    if sources and sources.strip():
+        src_list = [s.strip() for s in sources.split(",") if s.strip()]
+    else:
+        src_list = list(ALL_SOURCES)
+
+    logger.info("    Starting background pipeline  user_id=%s  sources=%s", user_id, src_list)
 
     _bg_jobs[job_key] = {"status": "running", "phase": "starting"}
 
     t = threading.Thread(
         target=_run_pipeline_bg,
-        args=(job_key, topic, user_id, user_ctx, cfg),
+        args=(job_key, topic, user_id, user_ctx, cfg, src_list),
         daemon=True,
     )
     t.start()
 
+    src_names = ", ".join(src_list)
     return (
         f"🔍 Started researching \"{topic}\"! This takes 1-3 minutes.\n\n"
-        f"I'll scrape papers from arXiv, OpenAlex, and Semantic Scholar, "
-        f"then run multi-agent debates on each one.\n\n"
-        f"Use `check_research_status(\"{topic}\")` to check progress, or just "
-        f"ask me in a minute!"
+        f"Scraping from: {src_names}\n"
+        f"Then running multi-agent debates on each paper found.\n\n"
+        f"Use `check_research_status(\"{topic}\")` to check progress — "
+        f"once done I'll show you the top ranked results.\n\n"
+        f"💡 These results will also appear on your Papermint dashboard."
     )
 
 
@@ -354,12 +440,14 @@ def check_research_status(topic: str) -> str:
     Check the progress of a background research pipeline.
 
     Use this after calling `research_topic(topic)` to see if it's done.
+    When the pipeline is complete, the response will include the top-ranked
+    results automatically (with links).
 
     Args:
         topic: The topic you started researching.
 
     Returns:
-        Current status: running, done, or error.
+        Current status: running, done (with results), or error.
     """
     logger.info(">>> check_research_status called  topic=%r", topic)
 
@@ -375,12 +463,18 @@ def check_research_status(topic: str) -> str:
         phase = job.get("phase", "working")
         return f"⏳ Still researching \"{topic}\" — currently **{phase}**. Check back in a minute!"
     elif status == "done":
-        return (
+        header = (
             f"✅ Research complete for \"{topic}\"!\n"
             f"• Papers scraped: {job.get('papers_count', 0)}\n"
             f"• Papers debated: {job.get('debates_count', 0)}\n\n"
-            f"Use `get_results(\"{topic}\")` to see the detailed verdicts."
+            f"💡 These results are now visible on your Papermint dashboard too.\n\n"
+            f"**Top ranked results:**\n\n"
         )
+        top = job.get("top_results", "")
+        if not top:
+            # Fallback: fetch fresh if not cached
+            top = _fetch_top_results_summary(topic, user_id, limit=5)
+        return header + top
     elif status == "error":
         return f"❌ Research failed for \"{topic}\": {job.get('error', 'Unknown error')}"
     else:
