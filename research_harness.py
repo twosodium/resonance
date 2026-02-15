@@ -1606,13 +1606,14 @@ def run_harness(
     only (1 round, no Google/biorxiv). Browserbase is always used to find fulltext PDFs and
     navigate to useful sources (view on journal → PDF) for selected papers.
     """
+    user_sources = sources if sources is not None else ALL_SOURCES
     if fast:
-        enabled = FAST_SOURCES
+        enabled = (user_sources & FAST_SOURCES) or FAST_SOURCES
         candidate_count = min(candidate_count, 20)
         max_rounds = 1
         skip_direct_filter = True
     else:
-        enabled = sources if sources is not None else ALL_SOURCES
+        enabled = user_sources
         max_rounds = 5
         skip_direct_filter = False
 

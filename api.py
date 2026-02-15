@@ -94,6 +94,28 @@ def _get_job(key: str) -> dict:
         return dict(_jobs.get(key, {"status": "unknown"}))
 
 
+_cancel_requested: dict[str, bool] = {}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/search/cancel — request cancel of running pipeline
+# ---------------------------------------------------------------------------
+
+@app.route("/api/search/cancel", methods=["POST"])
+def search_cancel():
+    """Set cancel flag for the job so the pipeline stops after current phase."""
+    data = request.get_json(silent=True) or {}
+    topic = (data.get("topic") or "").strip()
+    user_id = (data.get("user_id") or "").strip() or None
+    if not topic:
+        return jsonify({"error": "topic is required"}), 400
+    job_key = f"{user_id or 'anon'}:{topic}"
+    with _jobs_lock:
+        _cancel_requested[job_key] = True
+    _set_job(job_key, "cancelled")
+    return jsonify({"ok": True, "status": "cancelled"})
+
+
 # ---------------------------------------------------------------------------
 # POST /api/search
 # Body: { "topic": "...", "user_id": "..." }
@@ -122,14 +144,24 @@ def search():
     user_ctx = _build_user_context(user_id)
 
     def _run():
+        from pipeline import full_pipeline
         try:
             _set_job(job_key, "scraping")
+            cancel_check = lambda: _cancel_requested.get(job_key)
             result = full_pipeline(
                 topic=topic,
                 user_id=user_id,
                 user_context=user_ctx,
                 on_phase=lambda phase: _set_job(job_key, phase),
+                cancel_check=cancel_check,
             )
+            with _jobs_lock:
+                _cancel_requested.pop(job_key, None)
+            if _get_job(job_key).get("status") == "cancelled":
+                return
+            if result is None:
+                _set_job(job_key, "cancelled")
+                return
             _set_job(
                 job_key, "complete",
                 papers_count=result.get("papers_count", 0),
@@ -137,7 +169,11 @@ def search():
             )
         except Exception as exc:
             logger.error("Pipeline failed for %s: %s", topic, traceback.format_exc())
-            _set_job(job_key, "error", error=str(exc))
+            if _get_job(job_key).get("status") != "cancelled":
+                _set_job(job_key, "error", error=str(exc))
+        finally:
+            with _jobs_lock:
+                _cancel_requested.pop(job_key, None)
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
@@ -169,11 +205,13 @@ def status():
 def get_settings():
     """Return current pipeline config + env-level toggles."""
     cfg = load_config()
+    default_sources = ["arxiv", "biorxiv", "openalex", "semantic_scholar", "internet"]
     return jsonify({
         "topic": cfg.get("topic", ""),
         "candidate_count": cfg.get("candidate_count", 5),
         "top_k": cfg.get("top_k", 5),
         "debate_rounds": cfg.get("debate_rounds", 2),
+        "sources": cfg.get("sources", default_sources),
         "skip_browserbase": os.environ.get("SKIP_BROWSERBASE", "") in ("1", "true", "yes"),
         "has_anthropic_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
         "has_browserbase_key": bool(os.environ.get("BROWSERBASE_API_KEY")),
@@ -196,6 +234,11 @@ def put_settings():
     for key in ("topic", "candidate_count", "top_k", "debate_rounds"):
         if key in data:
             cfg[key] = data[key]
+    allowed_sources = {"arxiv", "biorxiv", "openalex", "semantic_scholar", "internet"}
+    if "sources" in data and isinstance(data["sources"], list):
+        cfg["sources"] = [s for s in data["sources"] if s in allowed_sources]
+        if not cfg["sources"]:
+            cfg["sources"] = list(allowed_sources)
     save_config(cfg)
 
     # Env-level toggles — persist to both os.environ AND .env file
@@ -456,6 +499,86 @@ def delete_paper(paper_id: int):
         return jsonify({"ok": True, "deleted_paper_id": paper_id})
     except Exception as exc:
         logger.error("Delete paper %d failed: %s", paper_id, exc)
+        return jsonify({"error": str(exc)}), 500
+
+
+# ---------------------------------------------------------------------------
+# POST /api/ideas/mindmap — get related-ideas graph (edges + similarity labels)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/ideas/mindmap", methods=["POST"])
+def ideas_mindmap():
+    """Given a list of ideas (id, paper_name, topic, one_liner), return edges with similarity labels via Claude."""
+    data = request.get_json(silent=True) or {}
+    ideas = data.get("ideas") or []
+    if not ideas or len(ideas) < 2:
+        return jsonify({"edges": []})
+
+    # Build a short list for the prompt
+    items = []
+    for i, idea in enumerate(ideas[:50]):  # cap at 50
+        idea_id = idea.get("id") or idea.get("paper_id") or str(i)
+        name = (idea.get("paper_name") or idea.get("topic") or "Unknown")[:120]
+        oneliner = (idea.get("one_liner") or "")[:200]
+        items.append({"id": str(idea_id), "title": name, "one_liner": oneliner})
+
+    prompt = (
+        "You are given a list of research ideas (papers). For each pair that are clearly related by theme, method, or domain, "
+        "output one edge with a short 'similarity topic' (1-5 words) describing what they have in common. "
+        "Do not relate every idea to every other; only include meaningful connections. "
+        "Return valid JSON only, no markdown, in this exact format: "
+        '{"edges": [{"from_id": "<id>", "to_id": "<id>", "label": "<similarity topic>"}, ...]}'
+        "\n\nIdeas:\n"
+        + "\n".join(f"- id={it['id']} | {it['title']}" + (f" | {it['one_liner']}" if it.get("one_liner") else "") for it in items)
+    )
+
+    try:
+        client = _get_chat_client()
+        resp = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = resp.content[0].text.strip()
+        # Strip markdown code block if present
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        import json as _json
+        out = _json.loads(text)
+        edges = out.get("edges") or []
+        # Normalize to from_id, to_id, label
+        for e in edges:
+            e.setdefault("from_id", str(e.get("from_id", "")))
+            e.setdefault("to_id", str(e.get("to_id", "")))
+            e.setdefault("label", e.get("label", "related"))
+        return jsonify({"edges": edges})
+    except Exception as exc:
+        logger.error("Mindmap edges failed: %s", exc)
+        return jsonify({"edges": []})
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/user/topics — clear all papers and debates for a user
+# ---------------------------------------------------------------------------
+
+@app.route("/api/user/topics", methods=["DELETE"])
+def clear_user_topics():
+    """Delete all papers and debates for the given user (clears previous topics)."""
+    data = request.get_json(silent=True) or {}
+    user_id = (data.get("user_id") or "").strip() or None
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    try:
+        from supabase import create_client
+        sb = create_client(
+            os.environ.get("SUPABASE_URL", ""),
+            os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY", ""),
+        )
+        sb.table("debates").delete().eq("user_id", user_id).execute()
+        sb.table("papers").delete().eq("user_id", user_id).execute()
+        return jsonify({"ok": True})
+    except Exception as exc:
+        logger.error("Clear user topics failed: %s", exc)
         return jsonify({"error": str(exc)}), 500
 
 

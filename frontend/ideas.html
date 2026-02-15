@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Ideas — Papermint</title>
   <link rel="stylesheet" href="styles.css" />
+  <script src="theme.js"></script>
 </head>
 <body>
   <div class="dashboard">
@@ -12,11 +13,17 @@
     <!-- ===== TOP BAR ===== -->
     <header class="dashboard-topbar">
       <div class="topbar-left">
-        <a href="dashboard.html" class="topbar-logo" style="text-decoration:none">◆ papermint</a>
+        <a href="index.html" class="topbar-logo" style="text-decoration:none">◆ papermint</a>
       </div>
       <div class="topbar-right">
         <a href="dashboard.html" class="btn btn-ghost">← Dashboard</a>
-        <div class="avatar" id="avatar">?</div>
+        <div class="avatar-dropdown">
+          <button type="button" class="avatar avatar-btn" id="avatar" onclick="toggleAvatarMenu()" title="Account">?</button>
+          <div class="avatar-menu" id="avatar-menu">
+            <a href="settings.html" class="avatar-menu-item">⚙ Preferences</a>
+            <button type="button" class="avatar-menu-item" onclick="handleLogout()">Log out</button>
+          </div>
+        </div>
       </div>
     </header>
 
@@ -59,6 +66,18 @@
   <script src="supabase.js"></script>
   <script>
     let allIdeas = [];
+
+    function toggleAvatarMenu() {
+      document.getElementById('avatar-menu').classList.toggle('open');
+    }
+    document.addEventListener('click', function(e) {
+      const d = document.querySelector('.avatar-dropdown');
+      if (d && !d.contains(e.target)) document.getElementById('avatar-menu').classList.remove('open');
+    });
+    async function handleLogout() {
+      await authSignOut();
+      window.location.href = 'index.html';
+    }
 
     (async () => {
       const user = await requireAuth();
@@ -104,70 +123,136 @@
         return;
       }
 
-      renderBlobs();
+      const ideasForApi = allIdeas.map(d => ({
+        id: String(d.id),
+        paper_name: (d.papers && d.papers.paper_name) || d.topic,
+        topic: d.topic,
+        one_liner: d.one_liner
+      }));
+      let edges = [];
+      try {
+        const res = await fetchMindmapEdges(ideasForApi);
+        edges = res.edges || [];
+      } catch (e) {
+        console.warn('Mindmap edges failed:', e);
+      }
+      renderMindmap(edges);
     }
 
-    function renderBlobs() {
+    let nodePositions = {};
+    let mindmapEdges = [];
+    let dragNode = null;
+    let dragOffset = { x: 0, y: 0 };
+
+    function renderMindmap(edges) {
+      mindmapEdges = edges;
       const container = document.getElementById('ideas-container');
       container.innerHTML = '';
+      const W = container.offsetWidth || 900;
+      const H = Math.max(container.offsetHeight || 500, 400);
+      const centerX = W / 2;
+      const centerY = H / 2;
+      const radius = Math.min(W, H) * 0.38;
+      const N = allIdeas.length;
 
-      const rect = container.getBoundingClientRect();
-      const W = rect.width || 900;
-      const H = rect.height || 500;
+      const nodeSize = 56;
 
-      // Size blobs by confidence: min 80px, max 180px
-      const placed = []; // {x, y, r} for collision detection
+      allIdeas.forEach((idea, i) => {
+        const id = String(idea.id);
+        const angle = (2 * Math.PI * i) / N - Math.PI / 2;
+        const x = centerX + radius * Math.cos(angle);
+        const y = centerY + radius * Math.sin(angle);
+        nodePositions[id] = { x, y };
+      });
+
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('class', 'mindmap-svg');
+      svg.setAttribute('width', '100%');
+      svg.setAttribute('height', '100%');
+      svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      container.appendChild(svg);
+
+      function redrawEdges() {
+        const g = svg.querySelector('g.edges');
+        if (!g) return;
+        g.innerHTML = '';
+        mindmapEdges.forEach(e => {
+          const from = nodePositions[String(e.from_id)];
+          const to = nodePositions[String(e.to_id)];
+          if (!from || !to) return;
+          const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+          line.setAttribute('x1', from.x);
+          line.setAttribute('y1', from.y);
+          line.setAttribute('x2', to.x);
+          line.setAttribute('y2', to.y);
+          line.setAttribute('class', 'mindmap-edge');
+          g.appendChild(line);
+          const midX = (from.x + to.x) / 2;
+          const midY = (from.y + to.y) / 2;
+          const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+          label.setAttribute('x', midX);
+          label.setAttribute('y', midY);
+          label.setAttribute('text-anchor', 'middle');
+          label.setAttribute('class', 'mindmap-edge-label');
+          label.textContent = (e.label || 'related').slice(0, 20);
+          g.appendChild(label);
+        });
+      }
+
+      const gEdges = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+      gEdges.setAttribute('class', 'edges');
+      svg.appendChild(gEdges);
+      redrawEdges();
 
       allIdeas.forEach((idea, i) => {
         const paper = idea.papers || {};
-        const confidence = idea.confidence || 0;
+        const id = String(idea.id);
+        const conf = idea.confidence || 0;
         const verdict = (idea.verdict || 'uncertain').toLowerCase();
-        const radius = 50 + confidence * 80; // 50..130 px radius
-        const diameter = radius * 2;
-
-        // Find a position that doesn't overlap too badly
-        let x, y;
-        let attempts = 0;
-        do {
-          x = radius + Math.random() * (W - diameter);
-          y = radius + Math.random() * (H - diameter);
-          attempts++;
-        } while (attempts < 80 && placed.some(p => {
-          const dx = p.x - x, dy = p.y - y;
-          return Math.sqrt(dx*dx + dy*dy) < (p.r + radius) * 0.85;
-        }));
-
-        placed.push({ x, y, r: radius });
-
-        const blob = document.createElement('div');
-        blob.className = `idea-blob ${verdict}`;
-        blob.style.width = diameter + 'px';
-        blob.style.height = diameter + 'px';
-        blob.style.left = (x - radius) + 'px';
-        blob.style.top = (y - radius) + 'px';
-        blob.style.animationDelay = (i * 0.08) + 's';
-        blob.classList.add('fade-in');
-
+        const pos = nodePositions[id];
+        const nodeEl = document.createElement('div');
+        nodeEl.className = `idea-node idea-blob ${verdict}`;
+        nodeEl.dataset.id = id;
+        nodeEl.style.width = nodeSize + 'px';
+        nodeEl.style.height = nodeSize + 'px';
+        nodeEl.style.left = (pos.x - nodeSize / 2) + 'px';
+        nodeEl.style.top = (pos.y - nodeSize / 2) + 'px';
         const title = paper.paper_name || idea.topic || 'Unknown';
-        const shortTitle = title.length > 40 ? title.slice(0, 37) + '…' : title;
+        const shortTitle = title.length > 24 ? title.slice(0, 21) + '…' : title;
+        nodeEl.innerHTML = `<span class="blob-title">${shortTitle}</span><span class="blob-verdict">${Math.round(conf * 100)}%</span>`;
 
-        blob.innerHTML = `
-          <span class="blob-title">${shortTitle}</span>
-          <span class="blob-verdict">${Math.round(confidence * 100)}%</span>
-        `;
+        nodeEl.addEventListener('mouseenter', e => showTooltip(e, idea));
+        nodeEl.addEventListener('mousemove', moveTooltip);
+        nodeEl.addEventListener('mouseleave', hideTooltip);
+        nodeEl.addEventListener('click', (e) => { if (!dragNode) window.location = `dashboard.html#topic=${encodeURIComponent(idea.topic || '')}`; });
 
-        // Tooltip on hover
-        blob.addEventListener('mouseenter', e => showTooltip(e, idea));
-        blob.addEventListener('mousemove', moveTooltip);
-        blob.addEventListener('mouseleave', hideTooltip);
-
-        // Click to go to dashboard topic
-        blob.addEventListener('click', () => {
-          window.location = `dashboard.html#topic=${encodeURIComponent(idea.topic || '')}`;
+        nodeEl.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          dragNode = id;
+          const rect = container.getBoundingClientRect();
+          dragOffset.x = (e.clientX - rect.left) - pos.x;
+          dragOffset.y = (e.clientY - rect.top) - pos.y;
         });
 
-        container.appendChild(blob);
+        container.appendChild(nodeEl);
       });
+
+      const onMove = (e) => {
+        if (!dragNode) return;
+        const rect = container.getBoundingClientRect();
+        const x = (e.clientX - rect.left) - dragOffset.x;
+        const y = (e.clientY - rect.top) - dragOffset.y;
+        nodePositions[dragNode].x = x;
+        nodePositions[dragNode].y = y;
+        const el = container.querySelector(`[data-id="${dragNode}"]`);
+        if (el) {
+          el.style.left = (x - nodeSize / 2) + 'px';
+          el.style.top = (y - nodeSize / 2) + 'px';
+        }
+        redrawEdges();
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', () => { dragNode = null; });
     }
 
     function showTooltip(e, idea) {
@@ -197,9 +282,8 @@
       document.getElementById('idea-tooltip').classList.remove('visible');
     }
 
-    // Reposition on resize
     window.addEventListener('resize', () => {
-      if (allIdeas.length > 0) renderBlobs();
+      if (allIdeas.length > 0 && mindmapEdges.length >= 0) renderMindmap(mindmapEdges);
     });
   </script>
 </body>

@@ -1,8 +1,12 @@
 {
   "topic": "mechanistic interpretability",
-  "candidate_count": 5,
+  "multiplier": 3,
+  "candidate_count": 10,
   "top_k": 5,
   "debate_rounds": 1,
+  "sources": [
+    "biorxiv"
+  ],
   "skip_browserbase": false,
   "anthropic_api_key": "",
   "browserbase_api_key": "",

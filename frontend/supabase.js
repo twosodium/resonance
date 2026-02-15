@@ -65,6 +65,24 @@ async function getProfile(userId) {
 // Backend API helpers  (call the Flask server)
 // ---------------------------------------------------------------------------
 
+/** GET /api/settings — used by dashboard for source toggles. */
+async function getSettings() {
+  const resp = await fetch(`${API_BASE}/api/settings`);
+  if (!resp.ok) throw new Error('Failed to load settings');
+  return resp.json();
+}
+
+/** PUT /api/settings — update settings (e.g. sources). */
+async function putSettings(body) {
+  const resp = await fetch(`${API_BASE}/api/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) throw new Error('Failed to save settings');
+  return resp.json();
+}
+
 /**
  * Trigger the full scrape + debate pipeline on the backend.
  * Returns immediately — the pipeline runs in a background thread.
@@ -84,8 +102,23 @@ async function triggerSearch(topic) {
 }
 
 /**
+ * Request cancellation of the current pipeline run for this topic.
+ */
+async function cancelSearchAPI(topic) {
+  const user = await getUser();
+  const userId = user?.id || null;
+  const resp = await fetch(`${API_BASE}/api/search/cancel`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ topic, user_id: userId }),
+  });
+  if (!resp.ok) throw new Error('Cancel failed');
+  return resp.json();
+}
+
+/**
  * Check pipeline job status for a given topic.
- * Returns: { status: "scraping"|"debating"|"complete"|"error"|"unknown", ... }
+ * Returns: { status: "scraping"|"debating"|"complete"|"error"|"cancelled"|"unknown", ... }
  */
 async function checkSearchStatus(topic) {
   const user = await getUser();
@@ -270,6 +303,36 @@ async function deletePaper(paperId) {
   return resp.json();
 }
 
+/**
+ * Fetch mind map edges (related ideas + similarity label) from the backend.
+ * ideas: array of { id, paper_name, topic, one_liner }
+ */
+async function fetchMindmapEdges(ideas) {
+  const resp = await fetch(`${API_BASE}/api/ideas/mindmap`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ideas }),
+  });
+  if (!resp.ok) return { edges: [] };
+  const data = await resp.json();
+  return data;
+}
+
+/**
+ * Clear all topics (papers and debates) for the current user.
+ */
+async function clearAllTopicsAPI() {
+  const user = await getUser();
+  const userId = user?.id;
+  if (!userId) throw new Error('Not logged in');
+  const resp = await fetch(`${API_BASE}/api/user/topics`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId }),
+  });
+  if (!resp.ok) throw new Error('Clear failed');
+  return resp.json();
+}
 
 // ---------------------------------------------------------------------------
 // Utility
