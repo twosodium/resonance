@@ -1,4 +1,4 @@
-/* Apply theme from localStorage (papermint-dark-mode: "1" = dark). Run early to avoid flash. */
+/* Apply theme from localStorage (dark-mode: "1" = dark). Run early to avoid flash. */
 (function () {
   var isDark = localStorage.getItem('papermint-dark-mode') === '1';
   document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Settings — Papermint</title>
+  <title>Settings — Resonance</title>
   <link rel="icon" type="image/png" href="papermint_logo.png" />
   <link rel="stylesheet" href="styles.css" />
   <script src="theme.js"></script>
@@ -14,7 +14,7 @@
     <!-- ===== TOP BAR ===== -->
     <header class="dashboard-topbar">
       <div class="topbar-left">
-        <a href="index.html" class="topbar-logo" style="text-decoration:none"><img src="papermint_logo.png" alt="" class="logo-icon" /> papermint</a>
+        <a href="index.html" class="topbar-logo" style="text-decoration:none"><img src="papermint_logo.png" alt="" class="logo-icon" /> resonance</a>
       </div>
       <div class="topbar-right">
         <a href="dashboard.html" class="btn btn-ghost">← Dashboard</a>
@@ -71,7 +71,7 @@
           </div>
 
           <div class="form-group">
-            <label for="settings-bio">How do you use Papermint?</label>
+            <label for="settings-bio">How do you use Resonance?</label>
             <textarea id="settings-bio" rows="3"
               placeholder="e.g. I'm scouting for breakthroughs in biotech to inform our fund's thesis…"
               style="width:100%; padding:10px 14px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-sm); font-size:0.9rem; font-family:inherit; resize:vertical;"></textarea>
@@ -123,6 +123,34 @@
           </div>
         </div>
 
+        <!-- Model & recency -->
+        <div class="settings-card">
+          <h3>Model & recency</h3>
+          <p class="settings-desc">Choose the Claude model for paper selection and pruning, and filter by publication date.</p>
+
+          <div class="form-group">
+            <label>Model (paper selection)</label>
+            <div class="toggle-row">
+              <div>
+                <strong>Fast</strong>
+                <span class="settings-sub">Claude Haiku — quicker, lighter</span>
+              </div>
+              <label class="toggle">
+                <input id="model-deep-toggle" type="checkbox" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <p class="settings-sub" style="margin-top:4px">When off: Fast (Haiku). When on: Deep (Sonnet).</p>
+          </div>
+
+          <div class="form-group">
+            <label for="earliest-date">Earliest publication date</label>
+            <input id="earliest-date" type="date" placeholder="YYYY-MM-DD"
+              style="width:100%; max-width:200px; padding:10px 14px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-sm); font-size:0.9rem;" />
+            <p class="settings-sub" style="margin-top:4px">Only papers published on or after this date are considered. Leave empty for no filter.</p>
+          </div>
+        </div>
+
         <!-- Pipeline Parameters -->
         <div class="settings-card">
           <h3>Pipeline</h3>
@@ -157,7 +185,7 @@
         <!-- Poke Integration -->
         <div class="settings-card">
           <h3>Poke Integration</h3>
-          <p class="settings-desc">Link your Papermint account to the Poke group-chat bot. Generate a token, then paste it into the chat.</p>
+          <p class="settings-desc">Link your Resonance account to the Poke group-chat bot. Generate a token, then paste it into the chat.</p>
 
           <div class="form-group">
             <label>Link Token</label>
@@ -348,6 +376,11 @@
 
         const darkEl = document.getElementById('dark-mode-toggle');
         if (darkEl) darkEl.checked = localStorage.getItem('papermint-dark-mode') === '1';
+
+        const modelDeep = document.getElementById('model-deep-toggle');
+        if (modelDeep) modelDeep.checked = (s.filter_llm_model || '').includes('sonnet');
+        const earliestDate = document.getElementById('earliest-date');
+        if (earliestDate && s.earliest_date) earliestDate.value = s.earliest_date.slice(0, 10);
       } catch (err) {
         showStatus('⚠ Could not load settings. Is the API server running?', true);
       }
@@ -371,6 +404,8 @@
         top_k: parseInt(document.getElementById('top-k').value),
         debate_rounds: parseInt(document.getElementById('debate-rounds').value),
         sources: sources.length ? sources : sourceIds,
+        filter_llm_model: document.getElementById('model-deep-toggle')?.checked ? 'claude-sonnet-4-5' : 'claude-haiku-4-5',
+        earliest_date: (document.getElementById('earliest-date')?.value || '').trim().slice(0, 10),
       };
 
       // Only send keys if user typed something

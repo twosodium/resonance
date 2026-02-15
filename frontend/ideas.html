@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Ideas — Papermint</title>
+  <title>Ideas — Resonance</title>
   <link rel="icon" type="image/png" href="papermint_logo.png" />
   <link rel="stylesheet" href="styles.css" />
   <script src="theme.js"></script>
@@ -15,7 +15,7 @@
     <header class="dashboard-topbar">
       <div class="topbar-left">
         <button type="button" class="btn btn-ghost sidebar-toggle" id="sidebar-toggle" onclick="toggleSidebar()" title="Toggle menu">☰</button>
-        <a href="index.html" class="topbar-logo" style="text-decoration:none"><img src="papermint_logo.png" alt="" class="logo-icon" /> papermint</a>
+        <a href="index.html" class="topbar-logo" style="text-decoration:none"><img src="papermint_logo.png" alt="" class="logo-icon" /> resonance</a>
       </div>
       <div class="topbar-right">
         <div class="avatar-dropdown">
@@ -143,10 +143,10 @@
         return;
       }
 
-      // Filter to PROMISING and INTERESTING only
+      // Filter to PROMISING and INTERESTING only, limit to 10 to prevent clutter
       allIdeas = (data || []).filter(d =>
         d.verdict === 'PROMISING' || d.verdict === 'INTERESTING'
-      );
+      ).slice(0, 10);
 
       document.getElementById('ideas-loading').style.display = 'none';
 
@@ -199,10 +199,11 @@
 
     const MIN_NODE = 40;          // smallest circle (0% confidence)
     const MAX_NODE = 160;         // biggest circle (100% confidence)
-    const DAMPING = 0.88;
-    const REPEL_FORCE = 4000;
-    const EDGE_SPRING = 0.005;
-    const CENTER_PULL = 0.002;
+    const DAMPING = 0.85;
+    const REPEL_FORCE = 8000;
+    const REPEL_RANGE = 3.0;     // repel when closer than N × combined radii
+    const EDGE_SPRING = 0.003;
+    const CENTER_PULL = 0.0005;  // very gentle — let user placements stick
 
     // Deterministic color per topic string
     const _topicColors = {};
@@ -238,7 +239,7 @@
       const H = Math.max(container.offsetHeight || 500, 500);
       const centerX = W / 2;
       const centerY = H / 2;
-      const radius = Math.min(W, H) * 0.32;
+      const radius = Math.min(W, H) * 0.42;
       const N = allIdeas.length;
 
       // ── SVG for edges ──
@@ -305,7 +306,7 @@
 
         container.appendChild(el);
 
-        nodes.push({ id, x, y, vx: 0, vy: 0, el, idea, size: sz });
+        nodes.push({ id, x, y, vx: 0, vy: 0, el, idea, size: sz, pinned: false });
       });
 
       // ── Mouse handlers for dragging (attach once) ──
@@ -325,6 +326,11 @@
           nd.vy = 0;
         });
         document.addEventListener('mouseup', () => {
+          if (dragNode && didDrag) {
+            // Pin the node so physics won't move it back
+            const nd = nodes.find(n => n.id === dragNode);
+            if (nd) nd.pinned = true;
+          }
           dragNode = null;
         });
       }
@@ -340,21 +346,22 @@
       function tick() {
         for (let i = 0; i < nodes.length; i++) {
           const a = nodes[i];
-          if (a.id === dragNode) continue;
+          // Skip nodes being dragged or pinned by the user
+          if (a.id === dragNode || a.pinned) continue;
           const aHalf = a.size / 2;
 
-          // Pull toward center
+          // Gentle pull toward center (very weak so nodes stay spread)
           a.vx += (centerX - a.x) * CENTER_PULL;
           a.vy += (centerY - a.y) * CENTER_PULL;
 
-          // Repel from other nodes (scaled by combined radii)
+          // Repel from other nodes — wider range so they stay well apart
           for (let j = 0; j < nodes.length; j++) {
             if (i === j) continue;
             const b = nodes[j];
             let dx = a.x - b.x;
             let dy = a.y - b.y;
             const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-            const minDist = (a.size + b.size) * 1.2;
+            const minDist = (a.size + b.size) * REPEL_RANGE;
             if (dist < minDist) {
               const force = REPEL_FORCE / (dist * dist);
               a.vx += (dx / dist) * force;
@@ -362,7 +369,7 @@
             }
           }
 
-          // Spring toward connected nodes
+          // Spring toward connected nodes (gentler)
           for (let j = 0; j < nodes.length; j++) {
             if (i === j) continue;
             const b = nodes[j];
@@ -370,7 +377,7 @@
             let dx = b.x - a.x;
             let dy = b.y - a.y;
             const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-            const ideal = (a.size + b.size) * 1.5;
+            const ideal = (a.size + b.size) * 2.5;
             a.vx += dx * EDGE_SPRING * (dist - ideal) / dist;
             a.vy += dy * EDGE_SPRING * (dist - ideal) / dist;
           }
