@@ -398,9 +398,26 @@ async function pollOnce(topic) {
     status = { status: 'unknown' };
   }
 
-  // 2. Fetch whatever data exists so far
-  const papers = await fetchPapersByTopic(topic);
-  const debates = await fetchDebatesByTopic(topic);
+  // 1b. The backend may summarize the user query into a shorter search_topic.
+  //     Papers/debates are stored under that summarized topic. Use it for DB queries
+  //     so we actually find the results.
+  const dbTopic = status.search_topic || topic;
+
+  // If the backend gave us a search_topic, update the sidebar & title to reflect it
+  if (status.search_topic && status.search_topic !== activeTopic) {
+    // Update sidebar entry: replace the original query with the actual DB topic
+    const oldEntry = topics.find(t => t.topic === activeTopic);
+    if (oldEntry) {
+      oldEntry.topic = status.search_topic;
+      renderSidebar();
+    }
+    activeTopic = status.search_topic;
+    document.getElementById('topic-title').textContent = status.search_topic;
+  }
+
+  // 2. Fetch whatever data exists so far (using the DB topic)
+  const papers = await fetchPapersByTopic(dbTopic);
+  const debates = await fetchDebatesByTopic(dbTopic);
 
   // 3. Update loading message based on phase
   const phase = status.status;
@@ -452,8 +469,8 @@ async function pollOnce(topic) {
     renderPapersOnly([]);
   }
 
-  // 5. Refresh sidebar topic counts
-  const topicEntry = topics.find(t => t.topic === topic);
+  // 5. Refresh sidebar topic counts (use dbTopic since the sidebar entry may have been renamed)
+  const topicEntry = topics.find(t => t.topic === dbTopic) || topics.find(t => t.topic === topic);
   if (topicEntry) {
     topicEntry.paper_count = papers.length;
     topicEntry.debate_count = debates.length;
