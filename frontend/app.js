@@ -79,7 +79,7 @@ async function loadTopics() {
 // ---------------------------------------------------------------------------
 
 function setupSidebarToggle() {
-  const stored = localStorage.getItem('papermint-sidebar-collapsed');
+  const stored = localStorage.getItem('resonance-sidebar-collapsed');
   if (stored === 'true') {
     document.querySelector('.dashboard').classList.add('sidebar-collapsed');
   }
@@ -88,7 +88,7 @@ function setupSidebarToggle() {
 function toggleSidebar() {
   const dash = document.querySelector('.dashboard');
   dash.classList.toggle('sidebar-collapsed');
-  localStorage.setItem('papermint-sidebar-collapsed', dash.classList.contains('sidebar-collapsed'));
+  localStorage.setItem('resonance-sidebar-collapsed', dash.classList.contains('sidebar-collapsed'));
 }
 
 // ---------------------------------------------------------------------------

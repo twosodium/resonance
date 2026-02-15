@@ -1,5 +1,5 @@
 """
-Papermint MCP Server — exposes Papermint tools to Poke.
+Resonance MCP Server — exposes Resonance tools to Poke.
 
 When `npx poke` runs, it starts this server on port 8765 and opens a tunnel
 so Poke's cloud AI can call these @mcp.tool() functions from group chats,
@@ -47,7 +47,7 @@ logging.getLogger("mcp.server.lowlevel.server").setLevel(logging.CRITICAL)
 
 # ── Startup diagnostics ────────────────────────────────────────────────
 logger.info("=" * 60)
-logger.info("Papermint MCP Server starting")
+logger.info("Resonance MCP Server starting")
 logger.info("PROJECT_DIR = %s", PROJECT_DIR)
 logger.info("Python       = %s", sys.executable)
 logger.info("=" * 60)
@@ -63,7 +63,7 @@ _OPTIONAL_ENV = [
     "BROWSERBASE_API_KEY",
     "BROWSERBASE_PROJECT_ID",
     "SKIP_BROWSERBASE",
-    "PAPERMINT_API_BASE",
+    "RESONANCE_API_BASE",
 ]
 for var in _REQUIRED_ENV:
     val = os.environ.get(var, "")
@@ -106,27 +106,27 @@ logger.info("=" * 60)
 
 # ── FastMCP app ─────────────────────────────────────────────────────────
 mcp = FastMCP(
-    "Papermint Research",
+    "Resonance Research",
     instructions=(
-        "You are Papermint, an AI research-scouting assistant. "
+        "You are Resonance, an AI research-scouting assistant. "
         "You help users discover promising new research papers and debate "
         "their merits. You can search for papers, run multi-agent debates, "
         "look up past results, and brainstorm follow-up ideas.\n\n"
         "ACCOUNT LINKING (CRITICAL):\n"
         "- On your VERY FIRST message in EVERY new conversation, ALWAYS call `whoami` to check.\n"
         "- If `whoami` says an account IS linked, greet the user by name and confirm: "
-        "'Hey [name]! I'm connected to your Papermint account. Is this you, or would you like to "
+        "'Hey [name]! I'm connected to your Resonance account. Is this you, or would you like to "
         "switch accounts?'\n"
         "- If the user says they are someone else or wants to switch, call `unlink_account()` first, "
         "then guide them through linking.\n"
-        "- If NOT linked, tell the user exactly this: 'To get started, please link your Papermint account:\n"
-        "  1. Open your Papermint dashboard (the website where you signed up)\n"
+        "- If NOT linked, tell the user exactly this: 'To get started, please link your Resonance account:\n"
+        "  1. Open your Resonance dashboard (the website where you signed up)\n"
         "  2. Go to Settings (gear icon in the sidebar)\n"
         "  3. Scroll to the Poke Integration section\n"
         "  4. Click Generate link token\n"
         "  5. Copy the token and paste it here'\n"
         "- Do NOT invent URLs, links, or authentication pages. There is NO external auth URL.\n"
-        "- The ONLY way to link is with a token from the Papermint Settings page.\n"
+        "- The ONLY way to link is with a token from the Resonance Settings page.\n"
         "- Wait for the user to provide the token, then call `link_account(token)`.\n\n"
         "RESEARCH WORKFLOW:\n"
         "- When the user asks you to research a topic, call `research_topic(topic)`. "
@@ -135,7 +135,7 @@ mcp = FastMCP(
         "after about 60-90 seconds to see if it's done.\n"
         "- When research is complete, `check_research_status` returns the top results "
         "with paper links — share these with the user immediately.\n"
-        "- Results from Poke queries are automatically saved to the user's Papermint "
+        "- Results from Poke queries are automatically saved to the user's Resonance "
         "dashboard — mention this so they know.\n\n"
         "OTHER RULES:\n"
         "- NEVER make up or assume any data. Only report what tools actually return.\n"
@@ -162,7 +162,7 @@ def _clear_session() -> None:
         logger.info("Session cleared (was user_id=%s)", _linked_user.get("user_id"))
     _linked_user = None
 
-API_BASE = os.environ.get("PAPERMINT_API_BASE", "http://localhost:5000")
+API_BASE = os.environ.get("RESONANCE_API_BASE", "http://localhost:5000")
 logger.info("API_BASE = %s", API_BASE)
 
 # ── Background pipeline tracker ─────────────────────────────────────────
@@ -197,29 +197,29 @@ def _require_linked(tool_name: str) -> str | None:
         return None
     logger.warning("Tool %s called but no account is linked!", tool_name)
     return (
-        "❌ No Papermint account linked yet.\n\n"
-        "To use this feature, go to your **Papermint Settings** page → "
+        "❌ No Resonance account linked yet.\n\n"
+        "To use this feature, go to your **Resonance Settings** page → "
         "**Poke Integration** → click **Generate link token**, then paste "
         "the token here using `link_account(token)`."
     )
 
 
 # =====================================================================
-#  Tool 0 — Link Papermint account (must be done first)
+#  Tool 0 — Link Resonance account (must be done first)
 # =====================================================================
 @mcp.tool()
 def link_account(token: str) -> str:
     """
-    Link your Papermint account so I can access your personal papers
+    Link your Resonance account so I can access your personal papers
     and search results.
 
-    Go to your Papermint Settings page → "Poke Integration" section →
+    Go to your Resonance Settings page → "Poke Integration" section →
     click "Generate link token", then paste the token here.
 
     The token is single-use and expires after 15 minutes.
 
     Args:
-        token: The link token from your Papermint Settings page (starts with "pmint_").
+        token: The link token from your Resonance Settings page (starts with "reso_").
 
     Returns:
         Confirmation that the account is linked, or an error message.
@@ -268,7 +268,7 @@ def link_account(token: str) -> str:
 @mcp.tool()
 def whoami() -> str:
     """
-    Check if a Papermint account is linked, and show the linked user info.
+    Check if a Resonance account is linked, and show the linked user info.
 
     Returns:
         The linked user's name and role, or a message saying no account is linked.
@@ -277,7 +277,7 @@ def whoami() -> str:
     if not _linked_user:
         return (
             "No account linked yet.\n"
-            "Go to your Papermint Settings page → 'Poke Integration' → "
+            "Go to your Resonance Settings page → 'Poke Integration' → "
             "'Generate link token', then use `link_account(token)` here."
         )
     name = _linked_user.get("first_name") or "User"
@@ -288,7 +288,7 @@ def whoami() -> str:
 @mcp.tool()
 def unlink_account() -> str:
     """
-    Unlink the current Papermint account so a different user can link theirs.
+    Unlink the current Resonance account so a different user can link theirs.
     Use this when a new user wants to connect, or to sign out.
 
     Returns:
@@ -298,8 +298,8 @@ def unlink_account() -> str:
                 _linked_user.get("user_id") if _linked_user else None)
     _clear_session()
     return (
-        "✅ Account unlinked. The next person can now link their own Papermint account.\n\n"
-        "To link a new account: go to Papermint Settings → Poke Integration → "
+        "✅ Account unlinked. The next person can now link their own Resonance account.\n\n"
+        "To link a new account: go to Resonance Settings → Poke Integration → "
         "Generate link token, then paste it here."
     )
 
@@ -413,7 +413,7 @@ def research_topic(topic: str, sources: str = "") -> str:
     Use `check_research_status(topic)` to check progress — once done it
     will include the top ranked results automatically.
 
-    Results are also saved to the user's Papermint dashboard.
+    Results are also saved to the user's Resonance dashboard.
 
     Requires a linked account.
 
@@ -469,7 +469,7 @@ def research_topic(topic: str, sources: str = "") -> str:
         f"Then running multi-agent debates on each paper found.\n\n"
         f"Use `check_research_status(\"{topic}\")` to check progress — "
         f"once done I'll show you the top ranked results.\n\n"
-        f"💡 These results will also appear on your Papermint dashboard."
+        f"💡 These results will also appear on your Resonance dashboard."
     )
 
 
@@ -506,7 +506,7 @@ def check_research_status(topic: str) -> str:
             f"✅ Research complete for \"{topic}\"!\n"
             f"• Papers scraped: {job.get('papers_count', 0)}\n"
             f"• Papers debated: {job.get('debates_count', 0)}\n\n"
-            f"💡 These results are now visible on your Papermint dashboard too.\n\n"
+            f"💡 These results are now visible on your Resonance dashboard too.\n\n"
             f"**Top ranked results:**\n\n"
         )
         top = job.get("top_results", "")
@@ -773,7 +773,7 @@ def brainstorm(question: str) -> str:
 
         user_ctx = _get_user_context()
         system = (
-            "You are Papermint, a research-scouting AI assistant. "
+            "You are Resonance, a research-scouting AI assistant. "
             "You help users brainstorm research directions, explain "
             "scientific concepts, and evaluate ideas. Be concise and "
             "insightful. Use plain language when possible."
@@ -804,7 +804,7 @@ def brainstorm(question: str) -> str:
 @mcp.tool()
 def get_config() -> str:
     """
-    Show the current Papermint pipeline configuration (candidate count,
+    Show the current Resonance pipeline configuration (candidate count,
     top-k, debate rounds, etc.).
 
     Does not require a linked account.

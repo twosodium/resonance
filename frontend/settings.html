@@ -375,7 +375,7 @@
         document.getElementById('browserbase-status').className = 'key-status ' + (s.has_browserbase_key ? 'set' : 'unset');
 
         const darkEl = document.getElementById('dark-mode-toggle');
-        if (darkEl) darkEl.checked = localStorage.getItem('papermint-dark-mode') === '1';
+        if (darkEl) darkEl.checked = localStorage.getItem('resonance-dark-mode') === '1';
 
         const modelDeep = document.getElementById('model-deep-toggle');
         if (modelDeep) modelDeep.checked = (s.filter_llm_model || '').includes('sonnet');

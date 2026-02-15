@@ -1,7 +1,7 @@
 {
   "topic": "mechanistic interpretability",
   "multiplier": 3,
-  "candidate_count": 10,
+  "candidate_count": 5,
   "top_k": 5,
   "debate_rounds": 1,
   "sources": [

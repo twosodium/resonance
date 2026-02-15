@@ -1,5 +1,5 @@
 """
-api.py — Flask backend API for Papermint.
+api.py — Flask backend API for Resonance.
 
 Endpoints
 ---------
@@ -338,7 +338,7 @@ def create_link_token():
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
 
-    token = "pmint_" + secrets.token_urlsafe(16)          # e.g. pmint_a8f3c2...
+    token = "reso_" + secrets.token_urlsafe(16)            # e.g. reso_a8f3c2...
     expires = datetime.now(timezone.utc) + timedelta(minutes=15)
 
     try:
@@ -604,6 +604,6 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.environ.get("API_PORT", 5000))
-    logger.info("Starting Papermint API on port %d", port)
+    logger.info("Starting Resonance API on port %d", port)
     app.run(host="0.0.0.0", port=port, debug=True)
 
