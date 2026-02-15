@@ -113,7 +113,12 @@ mcp = FastMCP(
         "their merits. You can search for papers, run multi-agent debates, "
         "look up past results, and brainstorm follow-up ideas.\n\n"
         "ACCOUNT LINKING (CRITICAL):\n"
-        "- On your VERY FIRST message, call the `whoami` tool to check if an account is linked.\n"
+        "- On your VERY FIRST message in EVERY new conversation, ALWAYS call `whoami` to check.\n"
+        "- If `whoami` says an account IS linked, greet the user by name and confirm: "
+        "'Hey [name]! I'm connected to your Papermint account. Is this you, or would you like to "
+        "switch accounts?'\n"
+        "- If the user says they are someone else or wants to switch, call `unlink_account()` first, "
+        "then guide them through linking.\n"
         "- If NOT linked, tell the user exactly this: 'To get started, please link your Papermint account:\n"
         "  1. Open your Papermint dashboard (the website where you signed up)\n"
         "  2. Go to Settings (gear icon in the sidebar)\n"
@@ -142,8 +147,20 @@ mcp = FastMCP(
 
 
 # ── Session state: linked user ──────────────────────────────────────────
-# In-memory — resets when the server restarts, which is fine.
-_linked_user: dict | None = None  # {user_id, first_name, role, bio}
+# Single-user-at-a-time: the linked user persists until someone explicitly
+# calls unlink_account() or link_account() (which auto-clears the old one).
+# The AI is instructed to call whoami at the start of each conversation and
+# confirm with the user that the linked account is correct.
+
+_linked_user: dict | None = None   # {user_id, first_name, role, bio}
+
+
+def _clear_session() -> None:
+    """Reset the linked user — next caller must re-link."""
+    global _linked_user
+    if _linked_user:
+        logger.info("Session cleared (was user_id=%s)", _linked_user.get("user_id"))
+    _linked_user = None
 
 API_BASE = os.environ.get("PAPERMINT_API_BASE", "http://localhost:5000")
 logger.info("API_BASE = %s", API_BASE)
@@ -210,6 +227,9 @@ def link_account(token: str) -> str:
     global _linked_user
     logger.info(">>> link_account called  token=%s…", token[:12] if token else "(empty)")
 
+    # Clear any previous session so a new user starts clean
+    _clear_session()
+
     import httpx
 
     try:
@@ -263,6 +283,25 @@ def whoami() -> str:
     name = _linked_user.get("first_name") or "User"
     role = _linked_user.get("role") or "not set"
     return f"🔗 Linked as **{name}** (role: {role})"
+
+
+@mcp.tool()
+def unlink_account() -> str:
+    """
+    Unlink the current Papermint account so a different user can link theirs.
+    Use this when a new user wants to connect, or to sign out.
+
+    Returns:
+        Confirmation that the account has been unlinked.
+    """
+    logger.info(">>> unlink_account called  _linked_user=%s",
+                _linked_user.get("user_id") if _linked_user else None)
+    _clear_session()
+    return (
+        "✅ Account unlinked. The next person can now link their own Papermint account.\n\n"
+        "To link a new account: go to Papermint Settings → Poke Integration → "
+        "Generate link token, then paste it here."
+    )
 
 
 # =====================================================================

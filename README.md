@@ -29,7 +29,6 @@ Copy `.env.example` to `.env` and set:
 - **OPENALEX_MAILTO** (optional) — email for OpenAlex polite pool; improves rate limits.
 - **SEMANTIC_SCHOLAR_API_KEY** (optional) — for higher Semantic Scholar rate limits.
 - **SUPABASE_URL** and **SUPABASE_SERVICE_ROLE_KEY** (or **SUPABASE_KEY**) — optional; when set, results are upserted to the **papers** table (use **SUPABASE_TABLE** or `--supabase-table` to override). Use `--no-supabase` to skip.
-- **BRIGHT_DATA_PROXY** (optional) — for Browserbase/Stagehand when needed.
 
 ## Run command
 
