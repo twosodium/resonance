@@ -319,7 +319,7 @@ def run_debate_pipeline(
             "stored": stored,
         }
 
-    max_workers = min(5, len(papers))
+    max_workers = min(8, len(papers))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         all_results = list(pool.map(_debate_one, enumerate(papers, 1)))
 

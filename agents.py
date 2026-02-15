@@ -18,7 +18,7 @@ from typing import Any
 
 from anthropic import Anthropic
 
-MODEL = "claude-sonnet-4-5-20250929"
+MODEL = "claude-haiku-4-5-20251001"
 MAX_TOKENS = 1024
 
 # ---------------------------------------------------------------------------

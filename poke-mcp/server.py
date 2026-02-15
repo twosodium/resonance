@@ -15,6 +15,8 @@ import json
 import os
 import sys
 import logging
+import traceback
+import threading
 
 # ── Make sure the parent project is importable ──────────────────────────
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -26,8 +28,81 @@ load_dotenv(os.path.join(PROJECT_DIR, ".env"))
 
 from fastmcp import FastMCP
 
+# ── Verbose logging ─────────────────────────────────────────────────────
+# Only show DEBUG for our own logger; silence noisy libraries
+logging.basicConfig(
+    level=logging.WARNING,                       # default: quiet
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger("poke-mcp")
-logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
+logger.setLevel(logging.DEBUG)                   # our logs: verbose
+logging.getLogger("docket").setLevel(logging.WARNING)
+logging.getLogger("fakeredis").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+# Silence noisy MCP transport errors (ClientDisconnect from tunnel timeouts)
+logging.getLogger("mcp.server.streamable_http").setLevel(logging.CRITICAL)
+logging.getLogger("mcp.server.lowlevel.server").setLevel(logging.CRITICAL)
+
+# ── Startup diagnostics ────────────────────────────────────────────────
+logger.info("=" * 60)
+logger.info("Papermint MCP Server starting")
+logger.info("PROJECT_DIR = %s", PROJECT_DIR)
+logger.info("Python       = %s", sys.executable)
+logger.info("=" * 60)
+
+# Check critical env vars
+_REQUIRED_ENV = [
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "ANTHROPIC_API_KEY",
+]
+_OPTIONAL_ENV = [
+    "SUPABASE_KEY",
+    "BROWSERBASE_API_KEY",
+    "BROWSERBASE_PROJECT_ID",
+    "SKIP_BROWSERBASE",
+    "PAPERMINT_API_BASE",
+]
+for var in _REQUIRED_ENV:
+    val = os.environ.get(var, "")
+    status = "✅ SET" if val.strip() else "❌ MISSING"
+    # Show first 8 chars only for security
+    preview = val[:8] + "…" if len(val) > 8 else val
+    logger.info("  env %-30s %s  (%s)", var, status, preview if val else "")
+for var in _OPTIONAL_ENV:
+    val = os.environ.get(var, "")
+    status = "SET" if val.strip() else "not set"
+    logger.info("  env %-30s %s", var, status)
+
+# Check that key imports work
+try:
+    from supabase import create_client
+    logger.info("  import supabase        ✅")
+except ImportError as e:
+    logger.error("  import supabase        ❌  %s", e)
+
+try:
+    from anthropic import Anthropic
+    logger.info("  import anthropic       ✅")
+except ImportError as e:
+    logger.error("  import anthropic       ❌  %s", e)
+
+try:
+    import pipeline  # noqa: F401
+    logger.info("  import pipeline        ✅")
+except Exception as e:
+    logger.error("  import pipeline        ❌  %s", e)
+
+try:
+    import agents  # noqa: F401
+    logger.info("  import agents          ✅")
+except Exception as e:
+    logger.error("  import agents          ❌  %s", e)
+
+logger.info("=" * 60)
+
 
 # ── FastMCP app ─────────────────────────────────────────────────────────
 mcp = FastMCP(
@@ -37,9 +112,22 @@ mcp = FastMCP(
         "You help users discover promising new research papers and debate "
         "their merits. You can search for papers, run multi-agent debates, "
         "look up past results, and brainstorm follow-up ideas.\n\n"
-        "IMPORTANT: If the user hasn't linked their Papermint account yet, "
-        "ask them to run `link_account` with the token from their Settings "
-        "page first. This lets you access their personal papers and results."
+        "ACCOUNT LINKING (CRITICAL):\n"
+        "- On your VERY FIRST message, call the `whoami` tool to check if an account is linked.\n"
+        "- If NOT linked, tell the user exactly this: 'To get started, please link your Papermint account:\n"
+        "  1. Open your Papermint dashboard (the website where you signed up)\n"
+        "  2. Go to Settings (gear icon in the sidebar)\n"
+        "  3. Scroll to the Poke Integration section\n"
+        "  4. Click Generate link token\n"
+        "  5. Copy the token and paste it here'\n"
+        "- Do NOT invent URLs, links, or authentication pages. There is NO external auth URL.\n"
+        "- The ONLY way to link is with a token from the Papermint Settings page.\n"
+        "- Wait for the user to provide the token, then call `link_account(token)`.\n\n"
+        "OTHER RULES:\n"
+        "- NEVER make up or assume any data. Only report what tools actually return.\n"
+        "- NEVER invent URLs or links. If you don't know a URL, say so.\n"
+        "- If a tool returns an error, show the error to the user.\n"
+        "- You can use `brainstorm` without a linked account for general questions."
     ),
 )
 
@@ -49,11 +137,18 @@ mcp = FastMCP(
 _linked_user: dict | None = None  # {user_id, first_name, role, bio}
 
 API_BASE = os.environ.get("PAPERMINT_API_BASE", "http://localhost:5000")
+logger.info("API_BASE = %s", API_BASE)
+
+# ── Background pipeline tracker ─────────────────────────────────────────
+# Tracks async research_topic jobs so the tool can return immediately
+_bg_jobs: dict[str, dict] = {}  # key = "user_id:topic"
 
 
 def _get_user_id() -> str | None:
     """Return the linked user_id, or None."""
-    return _linked_user["user_id"] if _linked_user else None
+    uid = _linked_user["user_id"] if _linked_user else None
+    logger.debug("_get_user_id() -> %s", uid)
+    return uid
 
 
 def _get_user_context() -> str:
@@ -65,7 +160,22 @@ def _get_user_context() -> str:
         parts.append(f"Role: {_linked_user['role']}")
     if _linked_user.get("bio"):
         parts.append(f"Bio: {_linked_user['bio']}")
-    return "\n".join(parts)
+    ctx = "\n".join(parts)
+    logger.debug("_get_user_context() -> %r", ctx[:100])
+    return ctx
+
+
+def _require_linked(tool_name: str) -> str | None:
+    """Return an error message if user is not linked, else None."""
+    if _linked_user:
+        return None
+    logger.warning("Tool %s called but no account is linked!", tool_name)
+    return (
+        "❌ No Papermint account linked yet.\n\n"
+        "To use this feature, go to your **Papermint Settings** page → "
+        "**Poke Integration** → click **Generate link token**, then paste "
+        "the token here using `link_account(token)`."
+    )
 
 
 # =====================================================================
@@ -89,17 +199,21 @@ def link_account(token: str) -> str:
         Confirmation that the account is linked, or an error message.
     """
     global _linked_user
+    logger.info(">>> link_account called  token=%s…", token[:12] if token else "(empty)")
+
     import httpx
 
     try:
-        resp = httpx.post(
-            f"{API_BASE}/api/link-token/verify",
-            json={"token": token},
-            timeout=10,
-        )
+        url = f"{API_BASE}/api/link-token/verify"
+        logger.info("    POST %s", url)
+        resp = httpx.post(url, json={"token": token}, timeout=10)
+        logger.info("    Response status=%d  body=%s", resp.status_code, resp.text[:200])
+
         if resp.status_code != 200:
             body = resp.json()
-            return f"❌ {body.get('error', 'Invalid token.')}"
+            err = body.get("error", "Invalid token.")
+            logger.warning("    link_account FAILED: %s", err)
+            return f"❌ {err}"
 
         data = resp.json()
         _linked_user = {
@@ -108,6 +222,8 @@ def link_account(token: str) -> str:
             "role": data.get("role", ""),
             "bio": data.get("bio", ""),
         }
+        logger.info("    ✅ Linked user_id=%s  name=%s  role=%s",
+                     _linked_user["user_id"], _linked_user["first_name"], _linked_user.get("role"))
 
         name = _linked_user["first_name"] or "there"
         return (
@@ -116,7 +232,7 @@ def link_account(token: str) -> str:
             f"Try asking me to search a topic or show your previous results."
         )
     except Exception as e:
-        logger.exception("link_account failed")
+        logger.exception("link_account EXCEPTION")
         return f"❌ Could not verify token: {e}"
 
 
@@ -128,6 +244,7 @@ def whoami() -> str:
     Returns:
         The linked user's name and role, or a message saying no account is linked.
     """
+    logger.info(">>> whoami called  _linked_user=%s", _linked_user)
     if not _linked_user:
         return (
             "No account linked yet.\n"
@@ -140,38 +257,16 @@ def whoami() -> str:
 
 
 # =====================================================================
-#  Tool 1 — Search & Debate (the main thing people will ask for)
+#  Tool 1 — Search & Debate (non-blocking — starts in background)
 # =====================================================================
-@mcp.tool()
-def research_topic(topic: str) -> str:
-    """
-    Search for research papers on a topic, then run a multi-agent debate
-    (Scout, Advocate, Skeptic, Moderator) on each paper to evaluate its
-    promise.
 
-    This is the core Papermint pipeline.  It:
-    1. Scrapes papers from arXiv (and optionally bioRxiv / web)
-    2. Stores them in the database
-    3. Runs a multi-agent debate on each paper
-    4. Returns a summary of the most promising papers
-
-    If an account is linked, results are saved to that user's profile.
-
-    Args:
-        topic: The research topic to investigate (e.g. "CRISPR gene editing",
-               "mechanistic interpretability", "room-temperature superconductors")
-
-    Returns:
-        A summary of the pipeline results — how many papers found, debated,
-        and the verdicts for the top papers.
-    """
-    from pipeline import full_pipeline, load_config
-
-    cfg = load_config()
-    user_id = _get_user_id()
-    user_ctx = _get_user_context()
-
+def _run_pipeline_bg(job_key: str, topic: str, user_id: str | None, user_ctx: str, cfg: dict):
+    """Background thread that runs the full pipeline and updates _bg_jobs."""
     try:
+        _bg_jobs[job_key]["phase"] = "scraping"
+        logger.info("    [bg] Starting pipeline for %r", topic)
+
+        from pipeline import full_pipeline
         result = full_pipeline(
             topic=topic,
             user_id=user_id,
@@ -181,21 +276,115 @@ def research_topic(topic: str) -> str:
             debate_rounds=cfg.get("debate_rounds", 2),
         )
 
-        linked_note = ""
-        if user_id:
-            linked_note = " Results are saved to your account."
-        else:
-            linked_note = " (Tip: link your account to save results to your profile.)"
+        _bg_jobs[job_key] = {
+            "status": "done",
+            "phase": "complete",
+            "papers_count": result.get("papers_count", 0),
+            "debates_count": result.get("debates_count", 0),
+        }
+        logger.info("    [bg] ✅ Pipeline complete: papers=%s debates=%s",
+                     result.get("papers_count"), result.get("debates_count"))
+    except Exception as e:
+        logger.exception("[bg] Pipeline EXCEPTION")
+        _bg_jobs[job_key] = {"status": "error", "phase": "failed", "error": str(e)}
 
+
+@mcp.tool()
+def research_topic(topic: str) -> str:
+    """
+    Search for research papers on a topic, then run a multi-agent debate
+    (Scout, Advocate, Skeptic, Moderator) on each paper to evaluate its
+    promise.
+
+    This kicks off the pipeline in the background and returns immediately.
+    Use `check_research_status(topic)` to check progress, then
+    `get_results(topic)` to see the verdicts once complete.
+
+    Requires a linked account.
+
+    Args:
+        topic: The research topic to investigate (e.g. "CRISPR gene editing",
+               "mechanistic interpretability", "room-temperature superconductors")
+
+    Returns:
+        Confirmation that the search has started (it runs in the background).
+    """
+    logger.info(">>> research_topic called  topic=%r", topic)
+
+    err = _require_linked("research_topic")
+    if err:
+        return err
+
+    from pipeline import load_config
+
+    cfg = load_config()
+    user_id = _get_user_id()
+    user_ctx = _get_user_context()
+    job_key = f"{user_id}:{topic}"
+
+    # Check if already running
+    existing = _bg_jobs.get(job_key, {})
+    if existing.get("status") == "running":
+        phase = existing.get("phase", "working")
+        return f"⏳ Already researching \"{topic}\" (currently {phase}). Use `check_research_status(\"{topic}\")` to check progress."
+
+    logger.info("    Starting background pipeline  user_id=%s", user_id)
+
+    _bg_jobs[job_key] = {"status": "running", "phase": "starting"}
+
+    t = threading.Thread(
+        target=_run_pipeline_bg,
+        args=(job_key, topic, user_id, user_ctx, cfg),
+        daemon=True,
+    )
+    t.start()
+
+    return (
+        f"🔍 Started researching \"{topic}\"! This takes 1-3 minutes.\n\n"
+        f"I'll scrape papers from arXiv, OpenAlex, and Semantic Scholar, "
+        f"then run multi-agent debates on each one.\n\n"
+        f"Use `check_research_status(\"{topic}\")` to check progress, or just "
+        f"ask me in a minute!"
+    )
+
+
+@mcp.tool()
+def check_research_status(topic: str) -> str:
+    """
+    Check the progress of a background research pipeline.
+
+    Use this after calling `research_topic(topic)` to see if it's done.
+
+    Args:
+        topic: The topic you started researching.
+
+    Returns:
+        Current status: running, done, or error.
+    """
+    logger.info(">>> check_research_status called  topic=%r", topic)
+
+    user_id = _get_user_id()
+    job_key = f"{user_id}:{topic}"
+
+    job = _bg_jobs.get(job_key)
+    if not job:
+        return f"No research job found for \"{topic}\". Use `research_topic(\"{topic}\")` to start one."
+
+    status = job.get("status", "unknown")
+    if status == "running":
+        phase = job.get("phase", "working")
+        return f"⏳ Still researching \"{topic}\" — currently **{phase}**. Check back in a minute!"
+    elif status == "done":
         return (
-            f"✅ Pipeline complete for \"{topic}\".{linked_note}\n"
-            f"• Papers scraped: {result.get('papers_count', 0)}\n"
-            f"• Papers debated: {result.get('debates_count', 0)}\n\n"
+            f"✅ Research complete for \"{topic}\"!\n"
+            f"• Papers scraped: {job.get('papers_count', 0)}\n"
+            f"• Papers debated: {job.get('debates_count', 0)}\n\n"
             f"Use `get_results(\"{topic}\")` to see the detailed verdicts."
         )
-    except Exception as e:
-        logger.exception("research_topic failed")
-        return f"❌ Pipeline failed: {e}"
+    elif status == "error":
+        return f"❌ Research failed for \"{topic}\": {job.get('error', 'Unknown error')}"
+    else:
+        return f"Status: {status}"
 
 
 # =====================================================================
@@ -210,6 +399,8 @@ def get_results(topic: str, limit: int = 10) -> str:
     for each debated paper.  Use this after `research_topic()` has run, or to
     look up past queries.
 
+    Requires a linked account.
+
     Args:
         topic: The research topic to look up.
         limit: Max number of results to return (default 10).
@@ -217,10 +408,19 @@ def get_results(topic: str, limit: int = 10) -> str:
     Returns:
         Formatted list of debate results with paper details.
     """
+    logger.info(">>> get_results called  topic=%r  limit=%d", topic, limit)
+
+    err = _require_linked("get_results")
+    if err:
+        return err
+
     from pipeline import _get_supabase
 
     try:
         sb = _get_supabase()
+        user_id = _get_user_id()
+        logger.info("    Querying debates for topic=%r user_id=%s", topic, user_id)
+
         query = (
             sb.table("debates")
             .select("*, papers(*)")
@@ -228,12 +428,12 @@ def get_results(topic: str, limit: int = 10) -> str:
             .order("confidence", desc=True)
             .limit(limit)
         )
-        user_id = _get_user_id()
         if user_id:
             query = query.eq("user_id", user_id)
 
         resp = query.execute()
         rows = resp.data or []
+        logger.info("    Got %d debate rows", len(rows))
 
         if not rows:
             return f"No results found for topic \"{topic}\".  Try running `research_topic(\"{topic}\")` first."
@@ -278,8 +478,8 @@ def get_results(topic: str, limit: int = 10) -> str:
         return "\n".join(lines)
 
     except Exception as e:
-        logger.exception("get_results failed")
-        return f"❌ Error fetching results: {e}"
+        logger.exception("get_results EXCEPTION")
+        return f"❌ Error fetching results: {e}\n\nFull traceback:\n{traceback.format_exc()}"
 
 
 # =====================================================================
@@ -288,24 +488,33 @@ def get_results(topic: str, limit: int = 10) -> str:
 @mcp.tool()
 def list_topics() -> str:
     """
-    List all topics that have been researched so far.
+    List all topics that have been researched by the linked user.
 
-    If an account is linked, only shows that user's topics.
+    Requires a linked account.
 
     Returns:
         A list of topics with paper counts.
     """
+    logger.info(">>> list_topics called")
+
+    err = _require_linked("list_topics")
+    if err:
+        return err
+
     from pipeline import _get_supabase
 
     try:
         sb = _get_supabase()
-        query = sb.table("papers").select("topic")
         user_id = _get_user_id()
+        logger.info("    Querying papers for user_id=%s", user_id)
+
+        query = sb.table("papers").select("topic")
         if user_id:
             query = query.eq("user_id", user_id)
 
         resp = query.execute()
         rows = resp.data or []
+        logger.info("    Got %d paper rows", len(rows))
 
         if not rows:
             return "No topics found yet.  Use `research_topic(\"your topic\")` to get started."
@@ -323,8 +532,8 @@ def list_topics() -> str:
         return "\n".join(lines)
 
     except Exception as e:
-        logger.exception("list_topics failed")
-        return f"❌ Error: {e}"
+        logger.exception("list_topics EXCEPTION")
+        return f"❌ Error: {e}\n\nFull traceback:\n{traceback.format_exc()}"
 
 
 # =====================================================================
@@ -338,32 +547,45 @@ def debate_paper(paper_id: int) -> str:
     Useful for re-evaluating a paper or debating one that was scraped but not
     yet debated.
 
+    Requires a linked account.
+
     Args:
         paper_id: The database ID of the paper to debate.
 
     Returns:
         The debate verdict and analysis.
     """
+    logger.info(">>> debate_paper called  paper_id=%d", paper_id)
+
+    err = _require_linked("debate_paper")
+    if err:
+        return err
+
     from pipeline import _get_supabase, store_debate, load_config
     from agents import run_debate
 
     try:
         sb = _get_supabase()
+        logger.info("    Fetching paper id=%d", paper_id)
         resp = sb.table("papers").select("*").eq("id", paper_id).single().execute()
         paper = resp.data
 
         if not paper:
+            logger.warning("    Paper id=%d not found", paper_id)
             return f"❌ No paper found with ID {paper_id}."
 
+        logger.info("    Paper found: %s", (paper.get("paper_name") or "?")[:60])
         cfg = load_config()
         user_ctx = _get_user_context()
+
+        logger.info("    Running debate (rounds=%d)…", cfg.get("debate_rounds", 2))
         result = run_debate(
             paper,
             num_rounds=cfg.get("debate_rounds", 2),
             user_context=user_ctx,
         )
 
-        # Store in DB
+        logger.info("    Storing debate result…")
         store_debate(sb, result, user_id=_get_user_id())
 
         v = result.verdict
@@ -383,11 +605,12 @@ def debate_paper(paper_id: int) -> str:
         if v.get("big_ideas"):
             lines.append(f"Big ideas: {'; '.join(v['big_ideas'][:3])}")
 
+        logger.info("    ✅ Debate complete: verdict=%s conf=%.2f", verdict, v.get("confidence", 0))
         return "\n".join(lines)
 
     except Exception as e:
-        logger.exception("debate_paper failed")
-        return f"❌ Error: {e}"
+        logger.exception("debate_paper EXCEPTION")
+        return f"❌ Error: {e}\n\nFull traceback:\n{traceback.format_exc()}"
 
 
 # =====================================================================
@@ -402,12 +625,16 @@ def brainstorm(question: str) -> str:
     concepts, or discuss research directions — without running the full pipeline.
     Good for quick back-and-forth in a group chat.
 
+    Does not require a linked account.
+
     Args:
         question: Any research-related question or brainstorming prompt.
 
     Returns:
         Claude's response.
     """
+    logger.info(">>> brainstorm called  question=%r", question[:100])
+
     try:
         from anthropic import Anthropic
 
@@ -421,6 +648,7 @@ def brainstorm(question: str) -> str:
         if user_ctx:
             system = f"{user_ctx}\n\n{system}"
 
+        logger.info("    Calling Claude (claude-haiku-4-5-20251001)…")
         client = Anthropic()
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -428,11 +656,13 @@ def brainstorm(question: str) -> str:
             system=system,
             messages=[{"role": "user", "content": question}],
         )
-        return resp.content[0].text
+        answer = resp.content[0].text
+        logger.info("    ✅ Got response (%d chars)", len(answer))
+        return answer
 
     except Exception as e:
-        logger.exception("brainstorm failed")
-        return f"❌ Error: {e}"
+        logger.exception("brainstorm EXCEPTION")
+        return f"❌ Error: {e}\n\nFull traceback:\n{traceback.format_exc()}"
 
 
 # =====================================================================
@@ -444,12 +674,16 @@ def get_config() -> str:
     Show the current Papermint pipeline configuration (candidate count,
     top-k, debate rounds, etc.).
 
+    Does not require a linked account.
+
     Returns:
         The current config as JSON.
     """
+    logger.info(">>> get_config called")
     from pipeline import load_config
 
     cfg = load_config()
+    logger.info("    Config: %s", json.dumps(cfg))
     return json.dumps(cfg, indent=2)
 
 
@@ -457,4 +691,5 @@ def get_config() -> str:
 #  Run the server
 # =====================================================================
 if __name__ == "__main__":
+    logger.info("Starting MCP server on 0.0.0.0:8765")
     mcp.run(transport="streamable-http", host="0.0.0.0", port=8765)
