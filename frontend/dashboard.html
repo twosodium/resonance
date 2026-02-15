@@ -30,8 +30,12 @@
         <!-- filled by JS -->
       </div>
       <div class="sidebar-spacer"></div>
+      <div class="sidebar-label">Explore</div>
+      <div class="sidebar-item" onclick="window.location='ideas.html'">
+        <span class="icon">✦</span> Top Ideas
+      </div>
       <div class="sidebar-label">Settings</div>
-      <div class="sidebar-item" onclick="alert('Settings coming soon')">
+      <div class="sidebar-item" onclick="window.location='settings.html'">
         <span class="icon">⚙</span> Preferences
       </div>
     </aside>
@@ -41,7 +45,7 @@
 
       <!-- Greeting -->
       <div class="greeting" id="greeting">
-        <h1>Good morning, Jane</h1>
+        <h1>Good morning</h1>
         <p>What research direction would you like to explore?</p>
       </div>
 
@@ -79,6 +83,7 @@
               <th>Published</th>
               <th>Verdict</th>
               <th>Confidence</th>
+              <th></th>
             </tr>
           </thead>
           <tbody id="papers-tbody">

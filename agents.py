@@ -32,11 +32,13 @@ hidden gems.  Your job:
 • Identify what is *genuinely novel* about the paper (method, dataset,
   result, or framing).
 • Estimate the *potential impact* — academic and commercial.
+• **Evaluate topicality** — how closely does this paper relate to the
+  user's search topic?  Is it core, adjacent, or only tangentially related?
 • Flag which investor / VC verticals should care (e.g. biotech, robotics,
   climate-tech, AI infra, etc.).
 • Be specific: cite numbers, comparisons, or prior work when possible.
 
-Keep your response focused and under 300 words.
+Keep your response concise and under 120 words.
 """
 
 ADVOCATE_SYSTEM = """\
@@ -47,10 +49,12 @@ promising research.  Your job:
 • Identify real-world applications, potential start-up ideas, or products
   that could emerge from this work.
 • Draw connections to adjacent fields or market trends.
+• Comment on how relevant the paper is to the search topic — if it's
+  adjacent, explain *why* it still matters.
 • Rebut the Skeptic's concerns point-by-point when they arise.
 
 Stay grounded in evidence — never resort to empty hype.
-Keep your response under 300 words.
+Keep your response concise and under 120 words.
 """
 
 SKEPTIC_SYSTEM = """\
@@ -60,12 +64,15 @@ You are the **Skeptic** — a sharp, fair, but tough critic.  Your job:
   dataset quality, reproducibility.
 • Identify *risks* — technical barriers, market timing, ethical issues,
   regulatory headwinds.
+• Assess **topicality** — if the paper is only loosely related to the
+  search topic, flag it.  A technically sound paper that's off-topic is
+  less useful.
 • Call out when the Scout or Advocate are over-extrapolating from the
   evidence.
 • Suggest what *additional evidence* would be needed to convince you.
 
-Be direct and specific.  Aim for constructive criticism, not dismissal.
-Keep your response under 300 words.
+Be concise and specific.  Aim for constructive criticism, not dismissal.
+Keep your response under 120 words.
 """
 
 MODERATOR_SYSTEM = """\
@@ -77,6 +84,7 @@ Produce a **structured JSON** verdict with exactly these keys:
 {
   "verdict": "PROMISING" | "INTERESTING" | "UNCERTAIN" | "WEAK",
   "confidence": <float 0-1>,
+  "topicality": <float 0-1, how relevant the paper is to the search topic>,
   "one_liner": "<1-sentence summary for a busy investor>",
   "key_strengths": ["...", "..."],
   "key_risks": ["...", "..."],
@@ -84,7 +92,11 @@ Produce a **structured JSON** verdict with exactly these keys:
   "follow_up_questions": ["...", "..."]
 }
 
-Return ONLY valid JSON — no markdown fences, no commentary outside the JSON.
+IMPORTANT RULES:
+• **Always** populate one_liner, key_strengths and key_risks — even when
+  the verdict is UNCERTAIN or WEAK.  There is always *something* to say.
+• topicality: 1.0 = core to the search topic, 0.5 = adjacent, 0.0 = unrelated.
+• Return ONLY valid JSON — no markdown fences, no commentary outside the JSON.
 """
 
 
@@ -174,7 +186,7 @@ def _format_paper(paper: dict[str, Any]) -> str:
 def run_debate(
     paper: dict[str, Any],
     *,
-    num_rounds: int = 2,
+    num_rounds: int = 1,
     client: Anthropic | None = None,
     model: str = MODEL,
     verbose: bool = False,
@@ -301,6 +313,7 @@ def run_debate(
         "key_risks": ["risks", "key_risk", "concerns"],
         "suggested_verticals": ["verticals", "industries", "sectors"],
         "follow_up_questions": ["questions", "follow_ups", "followup_questions"],
+        "topicality": ["topic_relevance", "relevance", "topicality_score"],
     }
     for canonical, aliases in _KEY_ALIASES.items():
         if canonical not in verdict:
@@ -308,6 +321,14 @@ def run_debate(
                 if alias in verdict:
                     verdict[canonical] = verdict.pop(alias)
                     break
+
+    # Guarantee every expected field exists, even for UNCERTAIN / WEAK papers
+    verdict.setdefault("one_liner", "")
+    verdict.setdefault("key_strengths", [])
+    verdict.setdefault("key_risks", [])
+    verdict.setdefault("suggested_verticals", [])
+    verdict.setdefault("follow_up_questions", [])
+    verdict.setdefault("topicality", 0.5)
 
     return DebateResult(
         paper=paper,

@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ideas — Papermint</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="dashboard">
+
+    <!-- ===== TOP BAR ===== -->
+    <header class="dashboard-topbar">
+      <div class="topbar-left">
+        <a href="dashboard.html" class="topbar-logo" style="text-decoration:none">◆ papermint</a>
+      </div>
+      <div class="topbar-right">
+        <a href="dashboard.html" class="btn btn-ghost">← Dashboard</a>
+        <div class="avatar" id="avatar">?</div>
+      </div>
+    </header>
+
+    <!-- ===== SIDEBAR ===== -->
+    <aside class="dashboard-sidebar">
+      <div class="sidebar-item" onclick="window.location='dashboard.html'">
+        <span class="icon">←</span> Dashboard
+      </div>
+      <div class="sidebar-spacer"></div>
+      <div class="sidebar-label">Explore</div>
+      <div class="sidebar-item active">
+        <span class="icon">✦</span> Top Ideas
+      </div>
+    </aside>
+
+    <!-- ===== MAIN ===== -->
+    <main class="dashboard-main" id="main-content">
+      <div class="greeting">
+        <h1>Top Ideas</h1>
+        <p>The most promising research ideas found across all your past searches.</p>
+      </div>
+
+      <div class="ideas-container" id="ideas-container">
+        <!-- Blobs injected by JS -->
+        <div id="ideas-loading" class="loading-indicator" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%)">
+          <div class="loading-spinner"></div>
+          <span>Loading ideas…</span>
+        </div>
+      </div>
+
+      <!-- Tooltip (follows mouse) -->
+      <div class="idea-tooltip" id="idea-tooltip">
+        <h4 id="tooltip-title"></h4>
+        <p id="tooltip-body"></p>
+      </div>
+    </main>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="supabase.js"></script>
+  <script>
+    let allIdeas = [];
+
+    (async () => {
+      const user = await requireAuth();
+      if (!user) return;
+
+      const { data: profile } = await getProfile(user.id);
+      const name = profile?.first_name || user.email?.split('@')[0] || '?';
+      document.getElementById('avatar').textContent = name.charAt(0).toUpperCase();
+
+      await loadIdeas();
+    })();
+
+    async function loadIdeas() {
+      const user = await getUser();
+      if (!user) return;
+
+      // Fetch all debates with joined paper data for this user, sorted by confidence
+      let query = sb.from('debates')
+        .select('*, papers(*)')
+        .order('confidence', { ascending: false });
+      query = query.eq('user_id', user.id);
+
+      const { data, error } = await query;
+      if (error) {
+        console.error('loadIdeas:', error);
+        return;
+      }
+
+      // Filter to PROMISING and INTERESTING only
+      allIdeas = (data || []).filter(d =>
+        d.verdict === 'PROMISING' || d.verdict === 'INTERESTING'
+      );
+
+      document.getElementById('ideas-loading').style.display = 'none';
+
+      if (allIdeas.length === 0) {
+        const container = document.getElementById('ideas-container');
+        container.innerHTML = `
+          <div style="text-align:center; padding:80px 24px; color:var(--text-tertiary);">
+            <p style="font-size:1.1rem; margin-bottom:8px;">No promising ideas yet</p>
+            <p>Run some searches from the <a href="dashboard.html" style="text-decoration:underline">dashboard</a> to see results here.</p>
+          </div>`;
+        return;
+      }
+
+      renderBlobs();
+    }
+
+    function renderBlobs() {
+      const container = document.getElementById('ideas-container');
+      container.innerHTML = '';
+
+      const rect = container.getBoundingClientRect();
+      const W = rect.width || 900;
+      const H = rect.height || 500;
+
+      // Size blobs by confidence: min 80px, max 180px
+      const placed = []; // {x, y, r} for collision detection
+
+      allIdeas.forEach((idea, i) => {
+        const paper = idea.papers || {};
+        const confidence = idea.confidence || 0;
+        const verdict = (idea.verdict || 'uncertain').toLowerCase();
+        const radius = 50 + confidence * 80; // 50..130 px radius
+        const diameter = radius * 2;
+
+        // Find a position that doesn't overlap too badly
+        let x, y;
+        let attempts = 0;
+        do {
+          x = radius + Math.random() * (W - diameter);
+          y = radius + Math.random() * (H - diameter);
+          attempts++;
+        } while (attempts < 80 && placed.some(p => {
+          const dx = p.x - x, dy = p.y - y;
+          return Math.sqrt(dx*dx + dy*dy) < (p.r + radius) * 0.85;
+        }));
+
+        placed.push({ x, y, r: radius });
+
+        const blob = document.createElement('div');
+        blob.className = `idea-blob ${verdict}`;
+        blob.style.width = diameter + 'px';
+        blob.style.height = diameter + 'px';
+        blob.style.left = (x - radius) + 'px';
+        blob.style.top = (y - radius) + 'px';
+        blob.style.animationDelay = (i * 0.08) + 's';
+        blob.classList.add('fade-in');
+
+        const title = paper.paper_name || idea.topic || 'Unknown';
+        const shortTitle = title.length > 40 ? title.slice(0, 37) + '…' : title;
+
+        blob.innerHTML = `
+          <span class="blob-title">${shortTitle}</span>
+          <span class="blob-verdict">${Math.round(confidence * 100)}%</span>
+        `;
+
+        // Tooltip on hover
+        blob.addEventListener('mouseenter', e => showTooltip(e, idea));
+        blob.addEventListener('mousemove', moveTooltip);
+        blob.addEventListener('mouseleave', hideTooltip);
+
+        // Click to go to dashboard topic
+        blob.addEventListener('click', () => {
+          window.location = `dashboard.html#topic=${encodeURIComponent(idea.topic || '')}`;
+        });
+
+        container.appendChild(blob);
+      });
+    }
+
+    function showTooltip(e, idea) {
+      const paper = idea.papers || {};
+      const tooltip = document.getElementById('idea-tooltip');
+      document.getElementById('tooltip-title').textContent =
+        paper.paper_name || idea.topic || 'Unknown';
+
+      const lines = [];
+      if (idea.one_liner) lines.push(idea.one_liner);
+      if (idea.topic) lines.push(`Topic: ${idea.topic}`);
+      lines.push(`Verdict: ${idea.verdict} · ${Math.round((idea.confidence||0)*100)}% confidence`);
+      if (idea.topicality != null) lines.push(`Topicality: ${Math.round(idea.topicality*100)}%`);
+      document.getElementById('tooltip-body').textContent = lines.join('\n');
+
+      tooltip.classList.add('visible');
+      moveTooltip(e);
+    }
+
+    function moveTooltip(e) {
+      const tooltip = document.getElementById('idea-tooltip');
+      tooltip.style.left = (e.clientX + 16) + 'px';
+      tooltip.style.top = (e.clientY + 16) + 'px';
+    }
+
+    function hideTooltip() {
+      document.getElementById('idea-tooltip').classList.remove('visible');
+    }
+
+    // Reposition on resize
+    window.addEventListener('resize', () => {
+      if (allIdeas.length > 0) renderBlobs();
+    });
+  </script>
+</body>
+</html>
+

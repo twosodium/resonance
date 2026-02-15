@@ -1,30 +1,51 @@
 """
-pipeline.py
-Run standalone:  python pipeline.py              # runs debate workflow
-                 python pipeline.py --scrape     # runs scrape workflow
+pipeline.py — End-to-end research pipeline.
+
+Phases
+------
+1. **Scrape** — Use ``research_harness.run_harness()`` to fetch papers
+   from arXiv / bioRxiv / web, then store in Supabase ``papers`` table.
+2. **Debate** — Pull papers from DB, run multi-agent debate on each,
+   store verdicts in Supabase ``debates`` table.
+3. **full_pipeline** — Scrape ➜ Debate in one call (used by the API).
+
+Run standalone::
+
+    python pipeline.py --scrape --topic "protein folding"
+    python pipeline.py --topic "protein folding"     # debate only
+    python pipeline.py --full --topic "protein folding"   # both
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
+import logging
 import math
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from supabase import create_client, Client as SupabaseClient
+from dotenv import load_dotenv
 
-from agents import DebateResult, run_debate
-from scrapers import run_scraper  # abstract todo
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(dotenv_path=os.path.join(_SCRIPT_DIR, ".env"))
+
+from supabase import Client as SupabaseClient, create_client  # noqa: E402
+
+from agents import DebateResult, run_debate  # noqa: E402
+
+logger = logging.getLogger("pipeline")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
 
 # ---------------------------------------------------------------------------
 # Config — loaded from config.json (dashboard writes this file)
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
+
 
 def load_config() -> dict:
     """Read config.json, falling back to sensible defaults."""
@@ -35,70 +56,138 @@ def load_config() -> dict:
         return {**defaults, **cfg}
     return defaults
 
+
 def save_config(cfg: dict) -> None:
     """Persist config back to config.json (called by the dashboard later)."""
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
 
+
+# ---------------------------------------------------------------------------
+# Supabase client  (prefers service-role key for backend writes)
+# ---------------------------------------------------------------------------
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # anon or service-role key
+SUPABASE_KEY = (
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    or os.getenv("SUPABASE_KEY")
+    or ""
+)
 
-
-# ---------------------------------------------------------------------------
-# Supabase client
-# ---------------------------------------------------------------------------
 
 def _get_supabase() -> SupabaseClient:
     """Return a Supabase client.  Raises if creds are missing."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError(
-            "Set SUPABASE_URL and SUPABASE_KEY env vars "
-            "(grab them from your Supabase project → Settings → API)."
+            "Set SUPABASE_URL and SUPABASE_KEY (or SUPABASE_SERVICE_ROLE_KEY) "
+            "env vars (grab them from your Supabase project → Settings → API)."
         )
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ---------------------------------------------------------------------------
-# A.  SCRAPE workflow  
+# Helpers
 # ---------------------------------------------------------------------------
 
-async def scrape_and_store(
-    topics: list[str] | None = None,
+def _sanitize(s: str | None) -> str | None:
+    """Remove null bytes that PostgreSQL text columns reject."""
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        return s
+    return "".join(c for c in s if c != "\x00" and (ord(c) >= 32 or c in "\n\r\t"))
+
+
+# ---------------------------------------------------------------------------
+# A.  SCRAPE workflow — uses research_harness
+# ---------------------------------------------------------------------------
+
+def scrape_and_store(
+    topic: str,
     *,
-    per_topic: int = 10,
+    user_id: str | None = None,
+    candidate_count: int = 50,
+    top_k: int = 20,
+    max_age_months: int = 0,
 ) -> list[dict]:
     """
-    Call the scraper, then upsert results into the ``papers`` table.
+    Fetch papers via ``research_harness.run_harness()``, convert to DB
+    schema dicts, and upsert into the ``papers`` table.
 
-    Returns the list of stored rows.
+    Parameters
+    ----------
+    topic : str
+        Research topic / query string.
+    user_id : str | None
+        UUID of the logged-in user (stored with every paper row).
+    candidate_count : int
+        How many candidates to fetch per source.
+    top_k : int
+        Max papers to keep after LLM filtering.
+
+    Returns
+    -------
+    list[dict]
+        The stored rows (including their DB ``id`` values).
     """
-    topics = topics or [load_config()["topic"]]
-    sb = _get_supabase()
+    from research_harness import paper_to_dict, run_harness
 
-    print("🔍  Scraping papers …")
-    papers = await run_scraper(topics=topics, per_topic=per_topic)
-    print(f"   Scrapers returned {len(papers)} papers")
+    logger.info("Scraping papers for topic=%r  (candidates=%d, top_k=%d)", topic, candidate_count, top_k)
+    papers = run_harness(
+        prompt=topic,
+        candidate_count=candidate_count,
+        top_k=top_k,
+        max_age_months=max_age_months,
+    )
+    logger.info("Harness returned %d papers", len(papers))
 
     if not papers:
         return []
 
-    # Normalise into the DB schema before upserting
-    rows = []
+    # Convert Paper dataclass → dict (matching the DB schema)
+    rows: list[dict] = []
     for p in papers:
-        rows.append({
-            "topic": p.get("topic", topics[0]),
-            "paper_name": p.get("paper_name", p.get("title", "")),
-            "paper_authors": p.get("paper_authors", p.get("authors", [])),
-            "published": p.get("published", p.get("date", None)),
-            "abstract": p.get("abstract", p.get("abstract", "")),
-            "journal": p.get("journal", ""),
-            "fulltext": p.get("fulltext", ""),
-            "url": p.get("url", ""),
-        })
+        row = paper_to_dict(p, topic=topic)
+        if user_id:
+            row["user_id"] = user_id
+        rows.append(row)
 
-    resp = sb.table("papers").upsert(rows, on_conflict="paper_name").execute()
-    stored = resp.data if resp.data else rows
-    print(f"   Stored {len(stored)} papers in DB")
+    # Upsert into Supabase
+    sb = _get_supabase()
+    try:
+        resp = sb.table("papers").upsert(rows, on_conflict="url").execute()
+        stored = resp.data if resp.data else rows
+    except Exception as exc:
+        err = str(exc)
+        # If upsert fails because there's no unique constraint on url,
+        # fall back to plain insert.
+        if "42P10" in err or "unique or exclusion constraint" in err.lower():
+            logger.warning("No UNIQUE on url — falling back to INSERT.")
+            try:
+                resp = sb.table("papers").insert(rows).execute()
+                stored = resp.data if resp.data else rows
+            except Exception as exc2:
+                logger.error("Insert also failed: %s", exc2)
+                stored = rows
+        else:
+            # Retry without columns that might not exist in the table
+            col_match = re.search(r"Could not find the ['\"](\w+)['\"] column", err)
+            if col_match:
+                col = col_match.group(1)
+                logger.warning("Column %r missing — retrying without it.", col)
+                for r in rows:
+                    r.pop(col, None)
+                try:
+                    resp = sb.table("papers").upsert(rows, on_conflict="url").execute()
+                    stored = resp.data if resp.data else rows
+                except Exception:
+                    resp = sb.table("papers").insert(rows).execute()
+                    stored = resp.data if resp.data else rows
+            else:
+                logger.error("Supabase upsert failed: %s", exc)
+                stored = rows
+
+    logger.info("Stored %d papers in DB", len(stored))
     return stored
 
 
@@ -109,40 +198,48 @@ async def scrape_and_store(
 def fetch_papers_by_topic(
     topic: str,
     *,
+    user_id: str | None = None,
     sb: SupabaseClient | None = None,
     limit: int = 50,
 ) -> list[dict]:
     """
-    SELECT papers from Supabase whose ``topic`` matches *topic*.
-
-    Uses a case-insensitive ``ilike`` so "Mechanistic Interpretability"
-    matches "mechanistic interpretability".
+    SELECT papers whose ``topic`` matches (case-insensitive).
+    Optionally filter by ``user_id``.
     """
     if sb is None:
         sb = _get_supabase()
 
-    resp = (
+    query = (
         sb.table("papers")
         .select("*")
         .ilike("topic", f"%{topic}%")
         .order("published", desc=True)
         .limit(limit)
-        .execute()
     )
+    if user_id:
+        query = query.eq("user_id", user_id)
+
+    resp = query.execute()
     return resp.data if resp.data else []
 
 
-def store_debate(sb: SupabaseClient, result: DebateResult) -> dict:
+def store_debate(
+    sb: SupabaseClient,
+    result: DebateResult,
+    *,
+    user_id: str | None = None,
+) -> dict:
     """Insert a single debate result into the ``debates`` table.
 
-    Links back to ``papers`` via the ``paper_id`` (FK → papers.id)
+    Links back to ``papers`` via ``paper_id`` (FK → papers.id).
     """
     v = result.verdict
-    row = {
-        "paper_id": result.paper.get("id"),  # FK → papers.id
+    row: dict[str, Any] = {
+        "paper_id": result.paper.get("id"),
         "topic": result.paper.get("topic", ""),
         "verdict": v.get("verdict", "UNCERTAIN"),
         "confidence": v.get("confidence", 0.0),
+        "topicality": v.get("topicality", 0.5),
         "one_liner": v.get("one_liner", ""),
         "key_strengths": json.dumps(v.get("key_strengths", [])),
         "key_risks": json.dumps(v.get("key_risks", [])),
@@ -152,6 +249,9 @@ def store_debate(sb: SupabaseClient, result: DebateResult) -> dict:
         "raw_verdict": result.raw_verdict,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    if user_id:
+        row["user_id"] = user_id
+
     resp = sb.table("debates").insert(row).execute()
     return resp.data[0] if resp.data else row
 
@@ -159,61 +259,44 @@ def store_debate(sb: SupabaseClient, result: DebateResult) -> dict:
 def run_debate_pipeline(
     topic: str | None = None,
     *,
+    user_id: str | None = None,
     multiplier: int | None = None,
-    debate_rounds: int = 3,
+    debate_rounds: int = 2,
     limit: int = 50,
     verbose: bool = False,
+    on_phase: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Pull papers for *topic* from the DB, debate each one, store verdicts,
     then return the top 1/multiplier papers ranked by confidence.
-
-    Parameters
-    ----------
-    topic : str | None
-        Filter papers by topic.  ``None`` → reads from config.json.
-    multiplier : int | None
-        Return the top 1/*multiplier* fraction of debated papers.
-    debate_rounds : int
-        Number of Scout ↔ Advocate ↔ Skeptic loops per paper.
-    limit : int
-        Max papers to pull from the DB.
-    verbose : bool
-        Print agent responses to stdout.
-
-    Returns
-    -------
-    list[dict]
-        Top papers after the multiplier cut, sorted by confidence desc.
     """
     cfg = load_config()
     topic = topic or cfg["topic"]
     multiplier = multiplier or cfg.get("multiplier", 3)
     sb = _get_supabase()
 
-    # 1. Fetch papers for this topic -----------------------------------------
-    print(f"📚  Fetching papers for topic: \"{topic}\" …")
-    papers = fetch_papers_by_topic(topic, sb=sb, limit=limit)
-    print(f"   Found {len(papers)} papers in DB")
+    # 1. Fetch papers --------------------------------------------------------
+    logger.info("Fetching papers for topic=%r, user_id=%s", topic, user_id)
+    papers = fetch_papers_by_topic(topic, user_id=user_id, sb=sb, limit=limit)
+    logger.info("Found %d papers in DB", len(papers))
 
     if not papers:
-        print("   Nothing to debate — run the scraper first, or check your topic.")
+        logger.info("Nothing to debate — run the scraper first, or check your topic.")
         return []
+
+    if on_phase:
+        on_phase("debating")
 
     # 2. Debate each paper ---------------------------------------------------
     all_results: list[dict[str, Any]] = []
     for idx, paper in enumerate(papers, 1):
         name = paper.get("paper_name", "?")
-        print(f"\n📄  [{idx}/{len(papers)}] Debating: {name}")
+        logger.info("[%d/%d] Debating: %s", idx, len(papers), name)
 
-        debate_result = run_debate(
-            paper,
-            num_rounds=debate_rounds,
-            verbose=verbose,
-        )
+        debate_result = run_debate(paper, num_rounds=debate_rounds, verbose=verbose)
 
-        # 3. Store verdict ----------------------------------------------------
-        stored = store_debate(sb, debate_result)
+        # 3. Store verdict ---------------------------------------------------
+        stored = store_debate(sb, debate_result, user_id=user_id)
         all_results.append({
             "paper": paper,
             "verdict": debate_result.verdict,
@@ -223,47 +306,95 @@ def run_debate_pipeline(
 
         v = debate_result.verdict
         emoji = {
-            "PROMISING": "🟢",
-            "INTERESTING": "🟡",
-            "UNCERTAIN": "🟠",
-            "WEAK": "🔴",
+            "PROMISING": "🟢", "INTERESTING": "🟡",
+            "UNCERTAIN": "🟠", "WEAK": "🔴",
         }.get(v.get("verdict", ""), "⚪")
-        print(f"   {emoji} {v.get('verdict', '?')}  (confidence {v.get('confidence', '?')})")
-        print(f"   → {v.get('one_liner', '')}")
+        logger.info("  %s %s  (confidence %.2f)", emoji, v.get("verdict", "?"), v.get("confidence", 0))
 
     # 4. Apply multiplier — keep top 1/multiplier by confidence ---------------
-    all_results.sort(
-        key=lambda r: r["verdict"].get("confidence", 0.0),
-        reverse=True,
-    )
+    all_results.sort(key=lambda r: r["verdict"].get("confidence", 0.0), reverse=True)
     top_n = max(1, math.ceil(len(all_results) / multiplier))
     top_results = all_results[:top_n]
 
-    print(f"\n{'='*60}")
-    print(f"🎯  Returning top {top_n} / {len(all_results)} papers (multiplier=1/{multiplier})")
-    for r in top_results:
-        c = r["verdict"].get("confidence", 0)
-        print(f"   • [{c:.2f}] {r['paper'].get('paper_name')}")
-    print("=" * 60)
-
+    logger.info("Returning top %d / %d papers (multiplier=1/%d)", top_n, len(all_results), multiplier)
     return top_results
 
+
+# ---------------------------------------------------------------------------
+# C.  FULL PIPELINE — scrape ➜ debate (called by api.py)
+# ---------------------------------------------------------------------------
+
+def full_pipeline(
+    topic: str,
+    *,
+    user_id: str | None = None,
+    candidate_count: int | None = None,
+    top_k: int | None = None,
+    debate_rounds: int | None = None,
+    verbose: bool = False,
+    on_phase: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """
+    Run the complete pipeline end-to-end:
+
+    1. Scrape papers for *topic* and store in DB with *user_id*.
+    2. Debate each newly-stored paper.
+    3. Return summary counts.
+
+    Pipeline params fall back to ``config.json`` if not provided.
+    """
+    cfg = load_config()
+    candidate_count = candidate_count or cfg.get("candidate_count", 5)
+    top_k = top_k or cfg.get("top_k", 5)
+    debate_rounds = debate_rounds or cfg.get("debate_rounds", 2)
+
+    if on_phase:
+        on_phase("scraping")
+
+    stored_papers = scrape_and_store(
+        topic,
+        user_id=user_id,
+        candidate_count=candidate_count,
+        top_k=top_k,
+    )
+
+    if on_phase:
+        on_phase("debating")
+
+    debate_results = run_debate_pipeline(
+        topic=topic,
+        user_id=user_id,
+        debate_rounds=debate_rounds,
+        verbose=verbose,
+        on_phase=on_phase,
+    )
+
+    if on_phase:
+        on_phase("complete")
+
+    return {
+        "topic": topic,
+        "papers_count": len(stored_papers),
+        "debates_count": len(debate_results),
+    }
+
+
+# ---------------------------------------------------------------------------
+# D.  GET top papers (read-only, used by dashboard)
+# ---------------------------------------------------------------------------
 
 def get_top_papers(
     topic: str | None = None,
     *,
+    user_id: str | None = None,
     multiplier: int | None = None,
 ) -> list[dict]:
-    """Fetch the top 1/*multiplier* debates, joined with paper data.
-
-    Reads ``topic`` and ``multiplier`` from config.json when not provided.
-    """
+    """Fetch the top 1/*multiplier* debates, joined with paper data."""
     cfg = load_config()
     topic = topic or cfg["topic"]
     multiplier = multiplier or cfg.get("multiplier", 3)
     sb = _get_supabase()
 
-    # Pull all debates for this topic, ordered by confidence desc
     query = (
         sb.table("debates")
         .select("*, papers(*)")
@@ -271,68 +402,69 @@ def get_top_papers(
     )
     if topic:
         query = query.ilike("topic", f"%{topic}%")
+    if user_id:
+        query = query.eq("user_id", user_id)
+
     resp = query.execute()
     rows = resp.data if resp.data else []
 
-    # Apply multiplier cut
     top_n = max(1, math.ceil(len(rows) / multiplier)) if rows else 0
     return rows[:top_n]
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     cfg = load_config()
 
-    parser = argparse.ArgumentParser(description="Research paper debate pipeline")
-    parser.add_argument(
-        "--scrape",
-        action="store_true",
-        help="Run the SCRAPE workflow (calls scrapers.run_scraper → DB).",
-    )
-    parser.add_argument(
-        "--topic",
-        type=str,
-        default=None,
-        help=f"Topic to scrape / debate (config.json default: {cfg['topic']}).",
-    )
-    parser.add_argument(
-        "--multiplier",
-        type=int,
-        default=None,
-        help=f"Return top 1/N papers (config.json default: {cfg.get('multiplier', 3)}).",
-    )
-    parser.add_argument(
-        "--rounds",
-        type=int,
-        default=2,
-        help="Debate rounds per paper (default: %(default)s).",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=20,
-        help="Max papers to pull from DB (default: %(default)s).",
-    )
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Print full agent responses.",
-    )
+    parser = argparse.ArgumentParser(description="Research paper pipeline")
+    parser.add_argument("--scrape", action="store_true", help="Run SCRAPE workflow only.")
+    parser.add_argument("--full", action="store_true", help="Run full pipeline (scrape + debate).")
+    parser.add_argument("--topic", type=str, default=None, help=f"Topic (default: {cfg['topic']}).")
+    parser.add_argument("--user-id", type=str, default=None, help="User UUID to tag rows with.")
+    parser.add_argument("--multiplier", type=int, default=None, help=f"Top 1/N (default: {cfg.get('multiplier', 3)}).")
+    parser.add_argument("--rounds", type=int, default=2, help="Debate rounds per paper.")
+    parser.add_argument("--limit", type=int, default=20, help="Max papers to pull from DB.")
+    parser.add_argument("--candidates", type=int, default=50, help="Candidates per scraper source.")
+    parser.add_argument("--top-k", type=int, default=20, help="Papers to keep after LLM filter.")
+    parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
-    if args.scrape:
-        # --- SCRAPE workflow ---
-        asyncio.run(scrape_and_store([args.topic] if args.topic else None))
+    topic = args.topic or cfg["topic"]
+
+    if args.full:
+        result = full_pipeline(
+            topic=topic,
+            user_id=args.user_id,
+            candidate_count=args.candidates,
+            top_k=args.top_k,
+            debate_rounds=args.rounds,
+            verbose=args.verbose,
+        )
+        print(json.dumps(result, indent=2))
+
+    elif args.scrape:
+        stored = scrape_and_store(
+            topic,
+            user_id=args.user_id,
+            candidate_count=args.candidates,
+            top_k=args.top_k,
+        )
+        print(f"Stored {len(stored)} papers.")
+
     else:
-        # --- DEBATE workflow ---
+        # Debate only
         results = run_debate_pipeline(
-            topic=args.topic,
+            topic=topic,
+            user_id=args.user_id,
             multiplier=args.multiplier,
             debate_rounds=args.rounds,
             limit=args.limit,
             verbose=args.verbose,
         )
 
-        # Dump results to JSON for inspection
         out_path = "pipeline_results.json"
         with open(out_path, "w") as f:
             json.dump(
@@ -347,4 +479,4 @@ if __name__ == "__main__":
                 f,
                 indent=2,
             )
-        print(f"\n💾  Full results saved to {out_path}")
+        print(f"💾  Full results saved to {out_path}")

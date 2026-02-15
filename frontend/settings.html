@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Settings — Papermint</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="dashboard">
+
+    <!-- ===== TOP BAR ===== -->
+    <header class="dashboard-topbar">
+      <div class="topbar-left">
+        <a href="dashboard.html" class="topbar-logo" style="text-decoration:none">◆ papermint</a>
+      </div>
+      <div class="topbar-right">
+        <a href="dashboard.html" class="btn btn-ghost">← Dashboard</a>
+        <div class="avatar" id="avatar">?</div>
+      </div>
+    </header>
+
+    <!-- ===== SIDEBAR ===== -->
+    <aside class="dashboard-sidebar">
+      <div class="sidebar-item" onclick="window.location='dashboard.html'">
+        <span class="icon">←</span> Back to dashboard
+      </div>
+      <div class="sidebar-spacer"></div>
+      <div class="sidebar-label">Settings</div>
+      <div class="sidebar-item active">
+        <span class="icon">⚙</span> Preferences
+      </div>
+    </aside>
+
+    <!-- ===== MAIN ===== -->
+    <main class="dashboard-main" id="main-content">
+      <div class="greeting">
+        <h1>Settings</h1>
+        <p>Configure API keys, pipeline parameters, and search preferences.</p>
+      </div>
+
+      <div id="settings-status" style="display:none" class="loading-indicator"></div>
+
+      <div class="settings-grid">
+
+        <!-- API Keys -->
+        <div class="settings-card">
+          <h3>API Keys</h3>
+          <p class="settings-desc">Your keys are stored in the running server's memory only.</p>
+
+          <div class="form-group">
+            <label for="anthropic-key">Anthropic API Key</label>
+            <div class="key-input-row">
+              <input id="anthropic-key" type="password" placeholder="sk-ant-…" autocomplete="off" />
+              <span id="anthropic-status" class="key-status"></span>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="browserbase-key">Browserbase API Key</label>
+            <div class="key-input-row">
+              <input id="browserbase-key" type="password" placeholder="bb_live_…" autocomplete="off" />
+              <span id="browserbase-status" class="key-status"></span>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="browserbase-project">Browserbase Project ID</label>
+            <input id="browserbase-project" type="text" placeholder="project_…" autocomplete="off" />
+          </div>
+        </div>
+
+        <!-- Pipeline Parameters -->
+        <div class="settings-card">
+          <h3>Pipeline</h3>
+          <p class="settings-desc">Controls how many papers are fetched and how many debate rounds to run.</p>
+
+          <div class="form-group">
+            <label for="candidate-count">Papers per source</label>
+            <div class="range-row">
+              <input id="candidate-count" type="range" min="1" max="20" value="5" />
+              <span id="candidate-count-val" class="range-val">5</span>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="top-k">Papers kept after filtering</label>
+            <div class="range-row">
+              <input id="top-k" type="range" min="1" max="20" value="5" />
+              <span id="top-k-val" class="range-val">5</span>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="debate-rounds">Debate rounds</label>
+            <div class="range-row">
+              <input id="debate-rounds" type="range" min="1" max="5" value="2" />
+              <span id="debate-rounds-val" class="range-val">2</span>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="multiplier">Multiplier (keep top 1/N)</label>
+            <div class="range-row">
+              <input id="multiplier" type="range" min="1" max="10" value="3" />
+              <span id="multiplier-val" class="range-val">3</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Toggles -->
+        <div class="settings-card">
+          <h3>Sources</h3>
+          <p class="settings-desc">Toggle which data sources are used during scraping.</p>
+
+          <div class="toggle-row">
+            <div>
+              <strong>arXiv</strong>
+              <span class="settings-sub">Always enabled (free, no API key needed)</span>
+            </div>
+            <label class="toggle disabled">
+              <input type="checkbox" checked disabled />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+
+          <div class="toggle-row">
+            <div>
+              <strong>Browserbase</strong>
+              <span class="settings-sub">bioRxiv + internet search via Stagehand</span>
+            </div>
+            <label class="toggle">
+              <input id="browserbase-toggle" type="checkbox" />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top: 24px">
+        <button class="btn btn-primary" onclick="saveSettings()" id="save-btn">Save settings</button>
+      </div>
+    </main>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="supabase.js"></script>
+  <script>
+    // --- Init ---
+    (async () => {
+      const user = await requireAuth();
+      if (!user) return;
+
+      const { data: profile } = await getProfile(user.id);
+      const name = profile?.first_name || user.email?.split('@')[0] || '?';
+      document.getElementById('avatar').textContent = name.charAt(0).toUpperCase();
+
+      await loadSettings();
+    })();
+
+    // Bind range inputs to display values
+    ['candidate-count', 'top-k', 'debate-rounds', 'multiplier'].forEach(id => {
+      const input = document.getElementById(id);
+      const display = document.getElementById(id + '-val');
+      input.addEventListener('input', () => { display.textContent = input.value; });
+    });
+
+    async function loadSettings() {
+      try {
+        const resp = await fetch(`${API_BASE}/api/settings`);
+        if (!resp.ok) throw new Error('Failed to load settings');
+        const s = await resp.json();
+
+        setRange('candidate-count', s.candidate_count || 5);
+        setRange('top-k', s.top_k || 5);
+        setRange('debate-rounds', s.debate_rounds || 2);
+        setRange('multiplier', s.multiplier || 3);
+
+        document.getElementById('browserbase-toggle').checked = !s.skip_browserbase;
+
+        document.getElementById('anthropic-status').textContent = s.has_anthropic_key ? '✓ set' : '✗ not set';
+        document.getElementById('anthropic-status').className = 'key-status ' + (s.has_anthropic_key ? 'set' : 'unset');
+        document.getElementById('browserbase-status').textContent = s.has_browserbase_key ? '✓ set' : '✗ not set';
+        document.getElementById('browserbase-status').className = 'key-status ' + (s.has_browserbase_key ? 'set' : 'unset');
+      } catch (err) {
+        showStatus('⚠ Could not load settings. Is the API server running?', true);
+      }
+    }
+
+    function setRange(id, val) {
+      const input = document.getElementById(id);
+      input.value = val;
+      document.getElementById(id + '-val').textContent = val;
+    }
+
+    async function saveSettings() {
+      const btn = document.getElementById('save-btn');
+      btn.textContent = 'Saving…';
+      btn.disabled = true;
+
+      const body = {
+        candidate_count: parseInt(document.getElementById('candidate-count').value),
+        top_k: parseInt(document.getElementById('top-k').value),
+        debate_rounds: parseInt(document.getElementById('debate-rounds').value),
+        multiplier: parseInt(document.getElementById('multiplier').value),
+        skip_browserbase: !document.getElementById('browserbase-toggle').checked,
+      };
+
+      // Only send keys if user typed something
+      const antKey = document.getElementById('anthropic-key').value.trim();
+      if (antKey) body.anthropic_api_key = antKey;
+
+      const bbKey = document.getElementById('browserbase-key').value.trim();
+      if (bbKey) body.browserbase_api_key = bbKey;
+
+      const bbProj = document.getElementById('browserbase-project').value.trim();
+      if (bbProj) body.browserbase_project_id = bbProj;
+
+      try {
+        const resp = await fetch(`${API_BASE}/api/settings`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!resp.ok) throw new Error('Save failed');
+        showStatus('✓ Settings saved', false);
+        await loadSettings(); // refresh status badges
+      } catch (err) {
+        showStatus('⚠ Failed to save settings: ' + err.message, true);
+      }
+
+      btn.textContent = 'Save settings';
+      btn.disabled = false;
+    }
+
+    function showStatus(msg, isError) {
+      const el = document.getElementById('settings-status');
+      el.style.display = 'flex';
+      el.style.borderColor = isError ? 'var(--red)' : 'var(--green)';
+      el.style.color = isError ? 'var(--red)' : 'var(--green)';
+      el.innerHTML = `<span>${msg}</span>`;
+      setTimeout(() => { el.style.display = 'none'; }, 4000);
+    }
+  </script>
+</body>
+</html>
+

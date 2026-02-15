@@ -721,23 +721,28 @@ def run_harness(
 ) -> list[Paper]:
     """Accumulate candidate_count from each of arXiv, bioRxiv, and internet; then Claude picks best top_k."""
     logger.info("Fetching up to %d candidates from each source (arXiv, bioRxiv, internet).", candidate_count)
+    arxiv_papers: list[Paper] = []
     try:
         arxiv_papers = fetch_arxiv(prompt, max_results=candidate_count)
         logger.info("arXiv: %d candidates.", len(arxiv_papers))
     except Exception as e:
-        raise RuntimeError(f"arXiv API error: {e}") from e
+        logger.warning("arXiv API failed: %s. Continuing without arXiv.", e)
 
     biorxiv_papers: list[Paper] = []
     internet_papers: list[Paper] = []
-    try:
-        biorxiv_papers, internet_papers = asyncio.run(_fetch_biorxiv_and_internet(prompt, candidate_count))
-        logger.info("bioRxiv: %d, internet: %d candidates.", len(biorxiv_papers), len(internet_papers))
-        if len(biorxiv_papers) == 0 and len(internet_papers) == 0:
-            logger.warning(
-                "No bioRxiv or internet candidates. For web results set BROWSERBASE_API_KEY, BROWSERBASE_PROJECT_ID, ANTHROPIC_API_KEY."
-            )
-    except Exception as e:
-        logger.warning("Browserbase fetch failed: %s. Continuing with arXiv only.", e)
+    skip_browserbase = os.environ.get("SKIP_BROWSERBASE", "").strip().lower() in ("1", "true", "yes")
+    if skip_browserbase:
+        logger.info("SKIP_BROWSERBASE is set — skipping bioRxiv & internet (Stagehand).")
+    else:
+        try:
+            biorxiv_papers, internet_papers = asyncio.run(_fetch_biorxiv_and_internet(prompt, candidate_count))
+            logger.info("bioRxiv: %d, internet: %d candidates.", len(biorxiv_papers), len(internet_papers))
+            if len(biorxiv_papers) == 0 and len(internet_papers) == 0:
+                logger.warning(
+                    "No bioRxiv or internet candidates. For web results set BROWSERBASE_API_KEY, BROWSERBASE_PROJECT_ID, ANTHROPIC_API_KEY."
+                )
+        except Exception as e:
+            logger.warning("Browserbase fetch failed: %s. Continuing with arXiv only.", e)
 
     seen_urls: set[str] = set()
     all_papers: list[Paper] = []
