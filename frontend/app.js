@@ -37,6 +37,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   setGreeting(firstName);
   setupSearch();
+  setupSidebarToggle();
+  await loadDashboardSources();
+  setupDashboardSourceToggles();
 
   // Load real topics from DB
   await loadTopics();
@@ -68,6 +71,76 @@ async function loadTopics() {
   renderSidebar();
 }
 
+
+// ---------------------------------------------------------------------------
+// Sidebar toggle
+// ---------------------------------------------------------------------------
+
+function setupSidebarToggle() {
+  const stored = localStorage.getItem('papermint-sidebar-collapsed');
+  if (stored === 'true') {
+    document.querySelector('.dashboard').classList.add('sidebar-collapsed');
+  }
+}
+
+function toggleSidebar() {
+  const dash = document.querySelector('.dashboard');
+  dash.classList.toggle('sidebar-collapsed');
+  localStorage.setItem('papermint-sidebar-collapsed', dash.classList.contains('sidebar-collapsed'));
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard source toggles (under search bar)
+// ---------------------------------------------------------------------------
+
+const DASHBOARD_SOURCE_IDS = ['arxiv', 'biorxiv', 'openalex', 'semantic_scholar', 'internet'];
+
+async function loadDashboardSources() {
+  const el = document.getElementById('search-sources');
+  if (!el) return;
+  try {
+    const s = await getSettings();
+    const sources = s.sources || DASHBOARD_SOURCE_IDS;
+    DASHBOARD_SOURCE_IDS.forEach(name => {
+      const cb = document.getElementById('ds-source-' + name);
+      if (cb) cb.checked = sources.includes(name);
+    });
+  } catch (_) {
+    DASHBOARD_SOURCE_IDS.forEach(name => {
+      const cb = document.getElementById('ds-source-' + name);
+      if (cb) cb.checked = true;
+    });
+  }
+}
+
+let _sourceSaveTimer = null;
+function getEnabledSourceNames() {
+  const labels = { arxiv: 'arXiv', biorxiv: 'bioRxiv', openalex: 'OpenAlex', semantic_scholar: 'Semantic Scholar', internet: 'Internet' };
+  return DASHBOARD_SOURCE_IDS
+    .filter(name => document.getElementById('ds-source-' + name)?.checked)
+    .map(name => labels[name] || name);
+}
+
+function setupDashboardSourceToggles() {
+  const el = document.getElementById('search-sources');
+  if (!el) return;
+  function saveSources() {
+    const sources = DASHBOARD_SOURCE_IDS.filter(name => {
+      const cb = document.getElementById('ds-source-' + name);
+      return cb && cb.checked;
+    });
+    putSettings({ sources: sources.length ? sources : DASHBOARD_SOURCE_IDS }).catch(() => {});
+  }
+  DASHBOARD_SOURCE_IDS.forEach(name => {
+    const cb = document.getElementById('ds-source-' + name);
+    if (cb) {
+      cb.addEventListener('change', () => {
+        clearTimeout(_sourceSaveTimer);
+        _sourceSaveTimer = setTimeout(saveSources, 400);
+      });
+    }
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Sidebar
@@ -146,8 +219,10 @@ async function startSearch(topic) {
   document.getElementById('greeting').querySelector('p').textContent =
     `Searching for "${topic}"…`;
 
-  // Show loading state
-  showLoading('Scraping papers from arXiv, bioRxiv & the web…');
+  // Show loading state (only the sources that are actually enabled)
+  const sourceNames = getEnabledSourceNames();
+  showLoading('Scraping papers from ' + (sourceNames.length ? sourceNames.join(', ') : 'sources') + '…');
+  showCancelSearchButton(true);
 
   try {
     await triggerSearch(topic);
@@ -169,11 +244,13 @@ async function startSearch(topic) {
 async function rerunSearch() {
   if (!activeTopic) return;
   showLoading('Re-running pipeline…');
+  showCancelSearchButton(true);
   try {
     await triggerSearch(activeTopic);
   } catch (err) {
     console.error('rerunSearch failed:', err);
     showLoading('⚠ Could not reach the backend. Is the API server running?');
+    showCancelSearchButton(false);
     return;
   }
   startPolling(activeTopic);
@@ -213,12 +290,28 @@ async function pollOnce(topic) {
   // 3. Update loading message based on phase
   const phase = status.status;
   if (phase === 'scraping') {
-    showLoading(`Scraping papers… ${papers.length} found so far`);
+    const sourceNames = getEnabledSourceNames();
+    showLoading(`Scraping from ${sourceNames.length ? sourceNames.join(', ') : 'sources'}… ${papers.length} found so far`);
   } else if (phase === 'debating') {
     showLoading(`Debating papers… ${debates.length}/${papers.length} analysed`);
-  } else if (phase === 'complete' || phase === 'error') {
+  } else if (phase === 'complete' || phase === 'error' || phase === 'cancelled') {
     hideLoading();
     stopPolling();
+    showCancelSearchButton(false);
+    if (phase === 'cancelled') {
+      document.getElementById('topic-meta').textContent =
+        papers.length > 0 || debates.length > 0
+          ? `Search cancelled · ${(debates.length || papers.length)} paper(s) so far`
+          : 'Search cancelled';
+      if (debates.length > 0) {
+        activeDebates = debates;
+        renderDebates(debates);
+      } else if (papers.length > 0) {
+        renderPapersOnly(papers);
+      } else {
+        renderPapersOnly([]);
+      }
+    }
   } else if (papers.length > 0 || debates.length > 0) {
     // Status might be "unknown" if we reloaded — that's fine, show data
     hideLoading();
@@ -251,6 +344,7 @@ async function pollOnce(topic) {
 
   if (phase === 'error') {
     hideLoading();
+    showCancelSearchButton(false);
     document.getElementById('topic-meta').textContent =
       `⚠ Pipeline error: ${status.error || 'unknown'}`;
   }
@@ -279,6 +373,45 @@ function showLoading(message) {
 function hideLoading() {
   const el = document.getElementById('loading-indicator');
   if (el) el.style.display = 'none';
+}
+
+function showCancelSearchButton(show) {
+  const btn = document.getElementById('cancel-search-btn');
+  if (btn) btn.style.display = show ? 'inline-flex' : 'none';
+}
+
+async function cancelSearch() {
+  if (!activeTopic) return;
+  const topic = activeTopic;
+  try {
+    stopPolling();
+    showCancelSearchButton(false);
+    document.getElementById('topic-meta').textContent = 'Cancelling…';
+    await cancelSearchAPI(topic);
+    // Refresh UI with whatever data we have and show cancelled state
+    const papers = await fetchPapersByTopic(topic);
+    const debates = await fetchDebatesByTopic(topic);
+    if (debates.length > 0) {
+      activeDebates = debates;
+      document.getElementById('topic-meta').textContent =
+        `Search cancelled · ${debates.length} paper${debates.length !== 1 ? 's' : ''} debated`;
+      renderDebates(debates);
+    } else if (papers.length > 0) {
+      document.getElementById('topic-meta').textContent =
+        `Search cancelled · ${papers.length} paper${papers.length !== 1 ? 's' : ''} scraped`;
+      renderPapersOnly(papers);
+    } else {
+      document.getElementById('topic-meta').textContent = 'Search cancelled';
+      renderPapersOnly([]);
+    }
+    hideLoading();
+  } catch (e) {
+    console.error('Cancel failed:', e);
+    document.getElementById('topic-meta').textContent = 'Search cancelled';
+    hideLoading();
+    stopPolling();
+    showCancelSearchButton(false);
+  }
 }
 
 
@@ -344,11 +477,25 @@ function showHome() {
   activeDebates = [];
   stopPolling();
   hideLoading();
+  showCancelSearchButton(false);
   document.getElementById('search-area').style.display = '';
   document.getElementById('topic-view').classList.remove('active');
   document.getElementById('greeting').querySelector('p').textContent =
     'What research direction would you like to explore?';
   renderSidebar();
+}
+
+async function clearAllTopics() {
+  if (!confirm('Clear all previous topics? This will remove all your papers and debate results.')) return;
+  try {
+    await clearAllTopicsAPI();
+    topics = [];
+    renderSidebar();
+    showHome();
+  } catch (err) {
+    console.error('clearAllTopics:', err);
+    alert('Failed to clear topics: ' + (err.message || 'unknown'));
+  }
 }
 
 
@@ -363,7 +510,7 @@ function renderDebates(debates) {
   if (debates.length === 0) {
     tbody.innerHTML = `
       <tr>
-        <td colspan="6" style="text-align:center; padding:48px 16px; color:var(--text-tertiary);">
+        <td colspan="7" style="text-align:center; padding:48px 16px; color:var(--text-tertiary);">
           No debate results yet — click <strong>Rerun search</strong> to analyse papers.
         </td>
       </tr>`;
@@ -382,6 +529,7 @@ function renderDebates(debates) {
     const authors = paper.paper_authors || [];
     const published = paper.published || '';
     const paperId = paper.id || debate.paper_id;
+    const url = paper.url || paper.paper_url || '';
 
     tr.innerHTML = `
       <td class="paper-title-cell">${paperName}</td>
@@ -394,6 +542,7 @@ function renderDebates(debates) {
           <span class="confidence-bar-fill" style="width:${confPct}%"></span>
         </span>
       </td>
+      <td class="paper-link-cell">${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" class="paper-link" onclick="event.stopPropagation()">View</a>` : '—'}</td>
       <td class="row-actions">
         ${paperId ? `<button class="chat-icon-btn" title="Chat about this paper" data-idx="${idx}">💬</button>` : ''}
         ${paperId ? `<button class="delete-btn" title="Delete paper" data-paper-id="${paperId}">✕</button>` : ''}
@@ -427,7 +576,7 @@ function renderPapersOnly(papers) {
   if (papers.length === 0) {
     tbody.innerHTML = `
       <tr>
-        <td colspan="6" style="text-align:center; padding:48px 16px; color:var(--text-tertiary);">
+        <td colspan="7" style="text-align:center; padding:48px 16px; color:var(--text-tertiary);">
           No papers yet — click <strong>Rerun search</strong> to fetch results.
         </td>
       </tr>`;
@@ -438,6 +587,7 @@ function renderPapersOnly(papers) {
     const tr = document.createElement('tr');
     tr.onclick = () => openPaperOnlyPanel(paper);
     const paperId = paper.id;
+    const url = paper.url || paper.paper_url || '';
 
     tr.innerHTML = `
       <td class="paper-title-cell">${paper.paper_name || 'Unknown'}</td>
@@ -445,6 +595,7 @@ function renderPapersOnly(papers) {
       <td class="paper-date-cell">${formatDate(paper.published)}</td>
       <td><span class="verdict-badge uncertain">Pending</span></td>
       <td>—</td>
+      <td class="paper-link-cell">${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" class="paper-link" onclick="event.stopPropagation()">View</a>` : '—'}</td>
       <td class="row-actions">
         ${paperId ? `<button class="chat-icon-btn" title="Chat about this paper">💬</button>` : ''}
         ${paperId ? `<button class="delete-btn" title="Delete paper">✕</button>` : ''}
@@ -650,6 +801,16 @@ function escapeAttr(s) {
   return s.replace(/'/g, "\\'").replace(/"/g, '&quot;');
 }
 
+function escapeHtml(s) {
+  if (!s) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 function formatAuthors(authors) {
   if (!authors) return 'Unknown';
   if (typeof authors === 'string') {
@@ -849,7 +1010,23 @@ async function handleDeletePaper(paperId, topic) {
 // Auth
 // ---------------------------------------------------------------------------
 
+function toggleAvatarMenu() {
+  const menu = document.getElementById('avatar-menu');
+  if (menu) menu.classList.toggle('open');
+}
+
+function closeAvatarMenu() {
+  const menu = document.getElementById('avatar-menu');
+  if (menu) menu.classList.remove('open');
+}
+
+document.addEventListener('click', (e) => {
+  const dropdown = document.querySelector('.avatar-dropdown');
+  if (dropdown && !dropdown.contains(e.target)) closeAvatarMenu();
+});
+
 async function handleLogout() {
+  closeAvatarMenu();
   await authSignOut();
   window.location.href = 'index.html';
 }

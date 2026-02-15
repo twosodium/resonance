@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Dashboard — Papermint</title>
   <link rel="stylesheet" href="styles.css" />
+  <script src="theme.js"></script>
 </head>
 <body>
   <div class="dashboard">
@@ -12,16 +13,22 @@
     <!-- ===== TOP BAR ===== -->
     <header class="dashboard-topbar">
       <div class="topbar-left">
-        <span class="topbar-logo">◆ papermint</span>
+        <button type="button" class="btn btn-ghost sidebar-toggle" id="sidebar-toggle" onclick="toggleSidebar()" title="Toggle menu">☰</button>
+        <a href="index.html" class="topbar-logo" style="text-decoration:none">◆ papermint</a>
       </div>
       <div class="topbar-right">
-        <button class="btn btn-ghost" onclick="handleLogout()">Log out</button>
-        <div class="avatar" id="avatar">J</div>
+        <div class="avatar-dropdown">
+          <button type="button" class="avatar avatar-btn" id="avatar" onclick="toggleAvatarMenu()" title="Account">J</button>
+          <div class="avatar-menu" id="avatar-menu">
+            <a href="settings.html" class="avatar-menu-item">⚙ Preferences</a>
+            <button type="button" class="avatar-menu-item" onclick="handleLogout()">Log out</button>
+          </div>
+        </div>
       </div>
     </header>
 
     <!-- ===== SIDEBAR — previous topics ===== -->
-    <aside class="dashboard-sidebar">
+    <aside class="dashboard-sidebar" id="dashboard-sidebar">
       <div class="sidebar-item" id="new-search-btn" onclick="showHome()">
         <span class="icon">+</span> New search
       </div>
@@ -29,6 +36,9 @@
       <div id="sidebar-topics">
         <!-- filled by JS -->
       </div>
+      <button type="button" class="sidebar-item sidebar-clear-btn" id="clear-topics-btn" onclick="clearAllTopics()" title="Remove all previous topics">
+        <span class="icon">🗑</span> Clear all topics
+      </button>
       <div class="sidebar-spacer"></div>
       <div class="sidebar-label">Explore</div>
       <div class="sidebar-item" onclick="window.location='ideas.html'">
@@ -60,6 +70,14 @@
           />
           <button class="search-btn" onclick="submitTopic()">→</button>
         </div>
+        <div class="search-sources" id="search-sources">
+          <span class="search-sources-label">Sources:</span>
+          <label class="source-chip"><input type="checkbox" id="ds-source-arxiv" /> arXiv</label>
+          <label class="source-chip"><input type="checkbox" id="ds-source-biorxiv" /> bioRxiv</label>
+          <label class="source-chip"><input type="checkbox" id="ds-source-openalex" /> OpenAlex</label>
+          <label class="source-chip"><input type="checkbox" id="ds-source-semantic_scholar" /> Semantic Scholar</label>
+          <label class="source-chip"><input type="checkbox" id="ds-source-internet" /> Internet</label>
+        </div>
         <span class="search-hint">Press Enter to explore a topic</span>
       </div>
 
@@ -70,9 +88,14 @@
             <h2 id="topic-title">Mechanistic Interpretability</h2>
             <span class="topic-meta" id="topic-meta">6 promising papers · last run 2 hours ago</span>
           </div>
-          <button class="btn btn-outline" id="rerun-btn">
-            <span>↻</span> Rerun search
-          </button>
+          <div class="topic-header-actions">
+            <button class="btn btn-outline" id="cancel-search-btn" onclick="cancelSearch()" style="display:none;">
+              <span>⏹</span> Cancel search
+            </button>
+            <button class="btn btn-outline" id="rerun-btn">
+              <span>↻</span> Rerun search
+            </button>
+          </div>
         </div>
 
         <table class="papers-table">
@@ -83,6 +106,7 @@
               <th>Published</th>
               <th>Verdict</th>
               <th>Confidence</th>
+              <th>Link</th>
               <th></th>
             </tr>
           </thead>

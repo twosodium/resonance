@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>How it works — Papermint</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="theme.js"></script>
+</head>
+<body>
+  <div class="landing">
+    <nav class="landing-nav">
+      <a href="index.html" class="landing-logo" style="text-decoration:none">◆ papermint</a>
+      <div class="landing-nav-links">
+        <a href="login.html" class="btn btn-ghost">Log in</a>
+        <a href="login.html#signup" class="btn btn-primary">Get started</a>
+      </div>
+    </nav>
+
+    <main class="how-content">
+      <a href="index.html" class="btn btn-ghost" style="margin-bottom:24px">← Back</a>
+      <h1>How Papermint works</h1>
+      <p class="how-lead">
+        Papermint helps you discover and evaluate research — from a single query to ranked papers and AI‑debated verdicts.
+      </p>
+
+      <section class="how-section">
+        <h2>Our mission</h2>
+        <p>
+          Researchers, investors, and builders are drowning in new papers. Papermint surfaces the ideas that matter:
+          we search across arXiv, bioRxiv, OpenAlex, Semantic Scholar, and the open web; we rank by relevance;
+          then our AI agents debate each paper and give you a clear verdict and confidence score. You spend less time
+          filtering and more time building.
+        </p>
+      </section>
+
+      <section class="how-section">
+        <h2>How it works</h2>
+        <ol class="how-steps">
+          <li><strong>You ask</strong> — Enter a research direction or question (e.g. “CRISPR gene editing improvements” or “mechanistic interpretability”). We optionally summarize long queries into a short search topic.</li>
+          <li><strong>We scrape</strong> — Our pipeline pulls papers from the sources you enable (arXiv, bioRxiv, OpenAlex, Semantic Scholar, internet search). You choose which sources in Preferences or on the dashboard.</li>
+          <li><strong>We rank</strong> — An AI model filters and ranks candidates so we keep the top‑k most relevant papers.</li>
+          <li><strong>We debate</strong> — For each paper, an AI agent argues for and against its importance over several rounds, then outputs a verdict (e.g. Promising, Interesting, Uncertain, Weak) and a confidence score.</li>
+          <li><strong>You explore</strong> — Results appear in your dashboard. You can open a paper, read the verdict, chat with the agent about it, or add it to your Top Ideas mind map.</li>
+        </ol>
+      </section>
+
+      <section class="how-section">
+        <h2>How you can use it</h2>
+        <ul class="how-list">
+          <li><strong>Scout for breakthroughs</strong> — Keep a feed of promising papers in areas you care about.</li>
+          <li><strong>Validate before investing</strong> — Use debate verdicts and confidence to triage what’s worth a deep read.</li>
+          <li><strong>Build a mind map</strong> — Top Ideas turns your best findings into a connected map; you can move nodes and see how concepts relate.</li>
+          <li><strong>Chat per paper</strong> — Ask follow‑up questions and get one‑liners and topicality scores to compare papers quickly.</li>
+        </ul>
+      </section>
+
+      <p class="how-cta">
+        <a href="login.html#signup" class="btn btn-primary">Get started</a>
+      </p>
+    </main>
+
+    <footer class="landing-footer">
+      Built at TreeHacks 2026 · Powered by Claude, Browserbase &amp; Bright&nbsp;Data
+    </footer>
+  </div>
+</body>
+</html>

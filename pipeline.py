@@ -55,6 +55,7 @@ def load_config() -> dict:
         "candidate_count": 8,
         "top_k": 5,
         "debate_rounds": 2,
+        "sources": ["arxiv", "biorxiv", "openalex", "semantic_scholar", "internet"],
     }
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH) as f:
@@ -122,6 +123,7 @@ def scrape_and_store(
     top_k: int = 20,
     max_age_months: int = 0,
     fast: bool = True,
+    sources: list[str] | None = None,
 ) -> list[dict]:
     """
     Fetch papers via research_harness (fast=API-only by default), convert to DB
@@ -129,12 +131,13 @@ def scrape_and_store(
     """
     from research_harness import paper_to_dict, run_harness
 
-    logger.info("Scraping papers for topic=%r  (candidates=%d, top_k=%d, fast=%s)", topic, candidate_count, top_k, fast)
+    logger.info("Scraping papers for topic=%r  (candidates=%d, top_k=%d, fast=%s, sources=%s)", topic, candidate_count, top_k, fast, sources)
     papers = run_harness(
         prompt=topic,
         candidate_count=candidate_count,
         top_k=top_k,
         max_age_months=max_age_months,
+        sources=set(sources) if sources else None,
         fast=fast,
     )
     logger.info("Harness returned %d papers", len(papers))
@@ -343,7 +346,8 @@ def full_pipeline(
     verbose: bool = False,
     on_phase: Callable[[str], None] | None = None,
     summarize_query: bool = True,
-) -> dict[str, Any]:
+    cancel_check: Callable[[], bool] | None = None,
+) -> dict[str, Any] | None:
     """
     Run the complete pipeline: (1) Optionally summarize user query to short topic.
     (2) Scrape papers (fast path: API-only, no browser) and store in DB.
@@ -354,6 +358,7 @@ def full_pipeline(
     top_k = top_k or cfg.get("top_k", 5)
     debate_rounds = debate_rounds or cfg.get("debate_rounds", 2)
     fast = os.environ.get("SKIP_BROWSERBASE", "") in ("1", "true", "yes") or True
+    sources = cfg.get("sources")
 
     if summarize_query and (len(topic) > 80 or "\n" in topic or topic.count(".") >= 1):
         search_topic = summarize_query_to_topic(topic)
@@ -370,13 +375,18 @@ def full_pipeline(
         candidate_count=candidate_count,
         top_k=top_k,
         fast=fast,
+        sources=sources,
     )
+
+    if cancel_check and cancel_check():
+        logger.info("Pipeline cancelled by user (after scrape)")
+        return None
 
     if on_phase:
         on_phase("debating")
 
     debate_results = run_debate_pipeline(
-        topic=topic,
+        topic=search_topic,
         user_id=user_id,
         user_context=user_context,
         debate_rounds=debate_rounds,
@@ -460,6 +470,7 @@ if __name__ == "__main__":
             user_id=args.user_id,
             candidate_count=args.candidates,
             top_k=args.top_k,
+            sources=cfg.get("sources"),
         )
         print(f"Stored {len(stored)} papers.")
 

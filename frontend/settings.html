@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Settings — Papermint</title>
   <link rel="stylesheet" href="styles.css" />
+  <script src="theme.js"></script>
 </head>
 <body>
   <div class="dashboard">
@@ -12,11 +13,17 @@
     <!-- ===== TOP BAR ===== -->
     <header class="dashboard-topbar">
       <div class="topbar-left">
-        <a href="dashboard.html" class="topbar-logo" style="text-decoration:none">◆ papermint</a>
+        <a href="index.html" class="topbar-logo" style="text-decoration:none">◆ papermint</a>
       </div>
       <div class="topbar-right">
         <a href="dashboard.html" class="btn btn-ghost">← Dashboard</a>
-        <div class="avatar" id="avatar">?</div>
+        <div class="avatar-dropdown">
+          <button type="button" class="avatar avatar-btn" id="avatar" onclick="toggleAvatarMenu()" title="Account">?</button>
+          <div class="avatar-menu" id="avatar-menu">
+            <a href="settings.html" class="avatar-menu-item">⚙ Preferences</a>
+            <button type="button" class="avatar-menu-item" onclick="handleLogoutSettings()">Log out</button>
+          </div>
+        </div>
       </div>
     </header>
 
@@ -97,6 +104,24 @@
           </div>
         </div>
 
+        <!-- Appearance -->
+        <div class="settings-card">
+          <h3>Appearance</h3>
+          <p class="settings-desc">Switch between light and dark mode.</p>
+          <div class="form-group">
+            <div class="toggle-row">
+              <div>
+                <strong>Dark mode</strong>
+                <span class="settings-sub">Use dark colors across the site</span>
+              </div>
+              <label class="toggle">
+                <input id="dark-mode-toggle" type="checkbox" onchange="toggleDarkMode(this.checked)" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
         <!-- Pipeline Parameters -->
         <div class="settings-card">
           <h3>Pipeline</h3>
@@ -148,29 +173,62 @@
           </div>
         </div>
 
-        <!-- Toggles -->
+        <!-- Source toggles -->
         <div class="settings-card">
           <h3>Sources</h3>
-          <p class="settings-desc">Toggle which data sources are used during scraping.</p>
+          <p class="settings-desc">Choose which sources to search and scrape. Disabled sources are skipped by the pipeline.</p>
 
           <div class="toggle-row">
             <div>
               <strong>arXiv</strong>
-              <span class="settings-sub">Always enabled (free, no API key needed)</span>
+              <span class="settings-sub">Preprint server (API, no key required)</span>
             </div>
-            <label class="toggle disabled">
-              <input type="checkbox" checked disabled />
+            <label class="toggle">
+              <input id="source-arxiv" type="checkbox" />
               <span class="toggle-slider"></span>
             </label>
           </div>
 
           <div class="toggle-row">
             <div>
-              <strong>Browserbase</strong>
-              <span class="settings-sub">bioRxiv + internet search via Stagehand</span>
+              <strong>bioRxiv</strong>
+              <span class="settings-sub">Biology preprints (via Browserbase)</span>
             </div>
             <label class="toggle">
-              <input id="browserbase-toggle" type="checkbox" />
+              <input id="source-biorxiv" type="checkbox" />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+
+          <div class="toggle-row">
+            <div>
+              <strong>OpenAlex</strong>
+              <span class="settings-sub">Open catalog of scholarly works (API)</span>
+            </div>
+            <label class="toggle">
+              <input id="source-openalex" type="checkbox" />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+
+          <div class="toggle-row">
+            <div>
+              <strong>Semantic Scholar</strong>
+              <span class="settings-sub">AI-backed search (API, optional key)</span>
+            </div>
+            <label class="toggle">
+              <input id="source-semantic_scholar" type="checkbox" />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+
+          <div class="toggle-row">
+            <div>
+              <strong>Internet search</strong>
+              <span class="settings-sub">Google / Google Scholar (via Browserbase)</span>
+            </div>
+            <label class="toggle">
+              <input id="source-internet" type="checkbox" />
               <span class="toggle-slider"></span>
             </label>
           </div>
@@ -188,6 +246,18 @@
   <script>
     let _settingsUserId = null;
     let _settingsRole = '';
+
+    function toggleAvatarMenu() {
+      document.getElementById('avatar-menu').classList.toggle('open');
+    }
+    document.addEventListener('click', function(e) {
+      const d = document.querySelector('.avatar-dropdown');
+      if (d && !d.contains(e.target)) document.getElementById('avatar-menu').classList.remove('open');
+    });
+    async function handleLogoutSettings() {
+      await authSignOut();
+      window.location.href = 'index.html';
+    }
 
     // --- Init ---
     (async () => {
@@ -263,12 +333,20 @@
         setRange('candidate-count', s.candidate_count || 5);
         setRange('top-k', s.top_k || 5);
         setRange('debate-rounds', s.debate_rounds || 2);
-        document.getElementById('browserbase-toggle').checked = !s.skip_browserbase;
+        const sources = s.sources || ['arxiv', 'biorxiv', 'openalex', 'semantic_scholar', 'internet'];
+        const sourceIds = ['arxiv', 'biorxiv', 'openalex', 'semantic_scholar', 'internet'];
+        sourceIds.forEach(name => {
+          const el = document.getElementById('source-' + name);
+          if (el) el.checked = sources.includes(name);
+        });
 
         document.getElementById('anthropic-status').textContent = s.has_anthropic_key ? '✓ set' : '✗ not set';
         document.getElementById('anthropic-status').className = 'key-status ' + (s.has_anthropic_key ? 'set' : 'unset');
         document.getElementById('browserbase-status').textContent = s.has_browserbase_key ? '✓ set' : '✗ not set';
         document.getElementById('browserbase-status').className = 'key-status ' + (s.has_browserbase_key ? 'set' : 'unset');
+
+        const darkEl = document.getElementById('dark-mode-toggle');
+        if (darkEl) darkEl.checked = localStorage.getItem('papermint-dark-mode') === '1';
       } catch (err) {
         showStatus('⚠ Could not load settings. Is the API server running?', true);
       }
@@ -285,11 +363,13 @@
       btn.textContent = 'Saving…';
       btn.disabled = true;
 
+      const sourceIds = ['arxiv', 'biorxiv', 'openalex', 'semantic_scholar', 'internet'];
+      const sources = sourceIds.filter(name => document.getElementById('source-' + name)?.checked);
       const body = {
         candidate_count: parseInt(document.getElementById('candidate-count').value),
         top_k: parseInt(document.getElementById('top-k').value),
         debate_rounds: parseInt(document.getElementById('debate-rounds').value),
-        skip_browserbase: !document.getElementById('browserbase-toggle').checked,
+        sources: sources.length ? sources : sourceIds,
       };
 
       // Only send keys if user typed something
@@ -330,6 +410,10 @@
 
       btn.textContent = 'Save settings';
       btn.disabled = false;
+    }
+
+    function toggleDarkMode(checked) {
+      if (typeof applyTheme === 'function') applyTheme(checked);
     }
 
     // --- Poke link token ---
