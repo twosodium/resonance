@@ -1,6 +1,6 @@
 # Research Paper Harness
 
-Finds **relevant** research papers by **accumulating** candidates from **arXiv**, **bioRxiv**, and the **internet** (Google Scholar via Browserbase/Stagehand), then runs a single **Claude** (Anthropic) filter to select the best N papers (the number you specify with `--top`). Outputs **JSON** with topic, paper_name, paper_authors, published, journal, abstract, fulltext, url.
+Finds **relevant** research papers by **accumulating** candidates from **arXiv**, **bioRxiv**, **OpenAlex**, **Semantic Scholar**, and the **internet** (Google/Scholar via Browserbase/Stagehand), then runs a single **Claude** (Anthropic) filter to select the best N papers (`--top`). Outputs **JSON** with topic, paper_name, paper_authors, published, journal, abstract, fulltext, url.
 
 ## Setup
 
@@ -24,8 +24,10 @@ python -m venv .venv
 
 Copy `.env.example` to `.env` and set:
 
-- **BROWSERBASE_API_KEY** and **BROWSERBASE_PROJECT_ID** — required for **bioRxiv** and **internet** search (Stagehand). If not set, only arXiv candidates are used.
-- **ANTHROPIC_API_KEY** — required for Stagehand (bioRxiv + internet) and for the final **Claude filter** that selects the best papers. Optional: **FILTER_LLM_MODEL** (default `claude-haiku-4-5`).
+- **BROWSERBASE_API_KEY** and **BROWSERBASE_PROJECT_ID** — required for **bioRxiv** and **internet** search (Stagehand). If not set, only API sources (arXiv, OpenAlex, Semantic Scholar) are used.
+- **ANTHROPIC_API_KEY** — required for Stagehand (bioRxiv + internet) and for the final **Claude filter**. Optional: **FILTER_LLM_MODEL** (default `claude-haiku-4-5`).
+- **OPENALEX_MAILTO** (optional) — email for OpenAlex polite pool; improves rate limits.
+- **SEMANTIC_SCHOLAR_API_KEY** (optional) — for higher Semantic Scholar rate limits.
 - **SUPABASE_URL** and **SUPABASE_SERVICE_ROLE_KEY** (or **SUPABASE_KEY**) — optional; when set, results are upserted to the **papers** table (use **SUPABASE_TABLE** or `--supabase-table` to override). Use `--no-supabase` to skip.
 - **BRIGHT_DATA_PROXY** (optional) — for Browserbase/Stagehand when needed.
 
@@ -41,10 +43,10 @@ python research_harness.py "<YOUR_TOPIC>" [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--candidates N` | 50 | Number of candidates to fetch from **each** source (arXiv, bioRxiv, internet). |
+| `--paragraph` | — | Treat the prompt as a paragraph: Claude summarizes it to a short research topic, then the harness runs on that topic. |
+| `--candidates N` | 50 | Number of candidates to fetch from **each** source (arXiv, bioRxiv, OpenAlex, Semantic Scholar, internet). |
 | `--top K` | 20 | Number of best papers to return after Claude filter. |
 | `--max-age-months N` | 0 | Keep only papers from the last N months (0 = no filter). |
-| `--proxy URL` | (env: BRIGHT_DATA_PROXY) | Bright Data proxy for Browserbase/Stagehand session. |
 | `--no-supabase` | — | Do not write to Supabase even if env is set. |
 | `--supabase-table NAME` | papers | Supabase table name for upsert. |
 
@@ -54,14 +56,14 @@ python research_harness.py "<YOUR_TOPIC>" [OPTIONS]
 # Basic run (outputs JSON to stdout)
 python research_harness.py "CRISPR gene editing"
 
+# Paragraph mode: summarize a long description into a topic, then run the harness
+python research_harness.py "I am interested in how armies were organized and supplied in China during the Ming and Qing dynasties, and how that affected military outcomes." --paragraph
+
 # Fewer candidates, fewer papers returned
 python research_harness.py "single cell RNA" --candidates 30 --top 10
 
 # Only papers from the last 12 months
 python research_harness.py "your topic" --max-age-months 12
-
-# With Bright Data proxy
-python research_harness.py "your topic" --proxy "http://user:pass@host:port"
 ```
 
 ## Output (JSON)
