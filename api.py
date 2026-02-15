@@ -101,12 +101,13 @@ def _get_job(key: str) -> dict:
 
 @app.route("/api/search", methods=["POST"])
 def search():
+    """Start pipeline: user synthesis query (or topic) → Claude summarizes → fast scrape → Supabase → debate."""
     data = request.get_json(silent=True) or {}
-    topic = (data.get("topic") or "").strip()
+    topic = (data.get("topic") or data.get("query") or "").strip()
     user_id = (data.get("user_id") or "").strip() or None
 
     if not topic:
-        return jsonify({"error": "topic is required"}), 400
+        return jsonify({"error": "topic or query is required"}), 400
 
     job_key = f"{user_id or 'anon'}:{topic}"
 
