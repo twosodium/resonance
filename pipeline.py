@@ -49,9 +49,6 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 
 def load_config() -> dict:
     """Read config.json, falling back to sensible defaults."""
-<<<<<<< HEAD
-    defaults = {"topic": "mechanistic interpretability"}
-=======
     defaults = {
         "topic": "",
         "multiplier": 3,
@@ -59,7 +56,6 @@ def load_config() -> dict:
         "top_k": 5,
         "debate_rounds": 2,
     }
->>>>>>> 681b2bc350d9df2b57dcf5bbcc9433603d30ef74
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
