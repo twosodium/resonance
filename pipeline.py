@@ -49,7 +49,13 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 
 def load_config() -> dict:
     """Read config.json, falling back to sensible defaults."""
-    defaults = {"topic": "mechanistic interpretability", "multiplier": 3}
+    defaults = {
+        "topic": "",
+        "multiplier": 3,
+        "candidate_count": 8,
+        "top_k": 5,
+        "debate_rounds": 2,
+    }
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
@@ -102,6 +108,12 @@ def _sanitize(s: str | None) -> str | None:
 # A.  SCRAPE workflow — uses research_harness
 # ---------------------------------------------------------------------------
 
+def summarize_query_to_topic(query: str) -> str:
+    """Turn a user synthesis query or paragraph into a short search topic via Claude."""
+    from research_harness import _summarize_paragraph_to_topic
+    return (_summarize_paragraph_to_topic(query) or query).strip() or query
+
+
 def scrape_and_store(
     topic: str,
     *,
@@ -109,35 +121,21 @@ def scrape_and_store(
     candidate_count: int = 50,
     top_k: int = 20,
     max_age_months: int = 0,
+    fast: bool = True,
 ) -> list[dict]:
     """
-    Fetch papers via ``research_harness.run_harness()``, convert to DB
+    Fetch papers via research_harness (fast=API-only by default), convert to DB
     schema dicts, and upsert into the ``papers`` table.
-
-    Parameters
-    ----------
-    topic : str
-        Research topic / query string.
-    user_id : str | None
-        UUID of the logged-in user (stored with every paper row).
-    candidate_count : int
-        How many candidates to fetch per source.
-    top_k : int
-        Max papers to keep after LLM filtering.
-
-    Returns
-    -------
-    list[dict]
-        The stored rows (including their DB ``id`` values).
     """
     from research_harness import paper_to_dict, run_harness
 
-    logger.info("Scraping papers for topic=%r  (candidates=%d, top_k=%d)", topic, candidate_count, top_k)
+    logger.info("Scraping papers for topic=%r  (candidates=%d, top_k=%d, fast=%s)", topic, candidate_count, top_k, fast)
     papers = run_harness(
         prompt=topic,
         candidate_count=candidate_count,
         top_k=top_k,
         max_age_months=max_age_months,
+        fast=fast,
     )
     logger.info("Harness returned %d papers", len(papers))
 
@@ -333,29 +331,34 @@ def full_pipeline(
     debate_rounds: int | None = None,
     verbose: bool = False,
     on_phase: Callable[[str], None] | None = None,
+    summarize_query: bool = True,
 ) -> dict[str, Any]:
     """
-    Run the complete pipeline end-to-end:
-
-    1. Scrape papers for *topic* and store in DB with *user_id*.
-    2. Debate each newly-stored paper.
-    3. Return summary counts.
-
-    Pipeline params fall back to ``config.json`` if not provided.
+    Run the complete pipeline: (1) Optionally summarize user query to short topic.
+    (2) Scrape papers (fast path: API-only, no browser) and store in DB.
+    (3) Debate each paper. Return summary counts.
     """
     cfg = load_config()
-    candidate_count = candidate_count or cfg.get("candidate_count", 5)
+    candidate_count = candidate_count or cfg.get("candidate_count", 8)
     top_k = top_k or cfg.get("top_k", 5)
     debate_rounds = debate_rounds or cfg.get("debate_rounds", 2)
+    fast = os.environ.get("SKIP_BROWSERBASE", "") in ("1", "true", "yes") or True
+
+    if summarize_query and (len(topic) > 80 or "\n" in topic or topic.count(".") >= 1):
+        search_topic = summarize_query_to_topic(topic)
+        logger.info("Summarized query to topic: %s", (search_topic or "")[:80])
+    else:
+        search_topic = topic.strip()
 
     if on_phase:
         on_phase("scraping")
 
     stored_papers = scrape_and_store(
-        topic,
+        search_topic,
         user_id=user_id,
         candidate_count=candidate_count,
         top_k=top_k,
+        fast=fast,
     )
 
     if on_phase:

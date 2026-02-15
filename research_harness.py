@@ -1589,25 +1589,37 @@ def _fetch_round(
     return combined
 
 
+# Fast path: API-only for candidate search (no Google/biorxiv browser search). Browserbase still used for fulltext (view on journal → PDF).
+FAST_SOURCES = {"arxiv", "openalex", "semantic_scholar"}
+
+
 def run_harness(
     prompt: str,
     candidate_count: int = 50,
     top_k: int = 20,
     max_age_months: int = 0,
     sources: set[str] | None = None,
+    fast: bool = False,
 ) -> list[Paper]:
     """
-    Fetch from enabled sources (default all). Preprocessing: keep only papers DIRECTLY about the topic.
-    If useful papers < top_k, fetch more (next page/offset) and repeat until we have at least top_k or max_rounds.
-    Then rank and select best top_k, fetch fulltext.
+    Fetch papers, rank with LLM, return top_k. When fast=True: candidate search uses API sources
+    only (1 round, no Google/biorxiv). Browserbase is always used to find fulltext PDFs and
+    navigate to useful sources (view on journal → PDF) for selected papers.
     """
-    enabled = sources if sources is not None else ALL_SOURCES
-    enabled_str = ",".join(sorted(enabled))
-    logger.info("Sources enabled: %s. Fetching up to %d candidates per source per round.", enabled_str, candidate_count)
+    if fast:
+        enabled = FAST_SOURCES
+        candidate_count = min(candidate_count, 20)
+        max_rounds = 1
+        skip_direct_filter = True
+    else:
+        enabled = sources if sources is not None else ALL_SOURCES
+        max_rounds = 5
+        skip_direct_filter = False
+
+    logger.info("Sources: %s, candidates=%d, top_k=%d, fast=%s", ",".join(sorted(enabled)), candidate_count, top_k, fast)
 
     all_candidates: list[Paper] = []
     seen_urls: set[str] = set()
-    max_rounds = 5
     useful: list[Paper] = []
 
     for round_index in range(max_rounds):
@@ -1618,72 +1630,41 @@ def run_harness(
                 seen_urls.add(p.url)
                 all_candidates.append(p)
                 added += 1
-        logger.info("Combined %d unique candidates after round %d.", len(all_candidates), round_index + 1)
-
         if max_age_months > 0:
             useful = _filter_recency(all_candidates, max_age_months)
         else:
             useful = list(all_candidates)
-        useful = _filter_directly_relevant(prompt, useful)
-
-        if len(useful) >= top_k:
-            logger.info("At least %d directly relevant papers; stopping fetch.", top_k)
-            break
-        if added == 0 and round_index > 0:
-            logger.info("No new papers in round %d; stopping.", round_index + 1)
+        if not skip_direct_filter:
+            useful = _filter_directly_relevant(prompt, useful)
+        if len(useful) >= top_k or (fast and len(all_candidates) > 0) or (added == 0 and round_index > 0):
             break
 
     if not useful:
         useful = all_candidates
     useful = _sort_papers_by_date(useful)
-    # When we have fewer than top_k directly relevant, let LLM choose from full candidate set so we can still return up to top_k
     candidate_for_rank = useful if len(useful) >= top_k else _sort_papers_by_date(all_candidates)
     all_papers = _filter_papers_with_llm(prompt, candidate_for_rank, top_k)
 
+    # PDF fulltext: HTTP fetch where we have URLs, then Browserbase to find PDFs and navigate to useful sources
     for i, p in enumerate(all_papers):
         if p.source == "arxiv":
-            logger.info("Fetching arXiv PDF full text for paper %d/%d: %s", i + 1, len(all_papers), p.url[:50] + "...")
             all_papers[i] = _fetch_arxiv_pdf_fulltext(p)
         elif p.source == "biorxiv":
-            logger.info("Fetching bioRxiv .full.pdf for paper %d/%d: %s", i + 1, len(all_papers), p.url[:50] + "...")
             all_papers[i] = _fetch_biorxiv_pdf_fulltext(p)
         elif p.source == "semantic_scholar":
-            logger.info("Fetching Semantic Scholar PDF full text for paper %d/%d: %s", i + 1, len(all_papers), p.url[:50] + "...")
             all_papers[i] = _fetch_semantic_scholar_pdf_fulltext(p)
         elif p.source == "openalex":
-            logger.info("Fetching OpenAlex PDF full text for paper %d/%d: %s", i + 1, len(all_papers), p.url[:50] + "...")
             all_papers[i] = _fetch_openalex_pdf_fulltext(p)
-
-    # Enrich S2/OpenAlex with Browserbase when abstract or fulltext still missing
-    need_browser: list[int] = [
-        i for i, p in enumerate(all_papers)
-        if p.source in ("semantic_scholar", "openalex")
-        and ((not p.abstract or not (p.abstract or "").strip()) or (not p.full_text or len((p.full_text or "").strip()) < 300))
-    ]
+    need_browser = [i for i, p in enumerate(all_papers) if (not (p.abstract or "").strip() or not (p.full_text or "").strip() or len((p.full_text or "").strip()) < 300)]
     if need_browser:
         try:
             asyncio.run(_enrich_papers_with_browser(all_papers, need_browser))
         except Exception as e:
-            logger.warning("Browserbase enrichment for S2/OpenAlex failed: %s", e)
+            logger.warning("Browserbase enrichment failed: %s", e)
 
-    # When fulltext could not be scraped, use abstract so output is never null when abstract exists
     for i, p in enumerate(all_papers):
         if (not (p.full_text or "").strip()) and (p.abstract and p.abstract.strip()):
-            all_papers[i] = Paper(
-                title=p.title,
-                authors=p.authors,
-                journal=p.journal,
-                url=p.url,
-                source=p.source,
-                published_date=p.published_date,
-                abstract=p.abstract,
-                full_text=p.abstract.strip(),
-                pdf_url=p.pdf_url,
-                work_id=p.work_id,
-                doi=p.doi,
-            )
-
-    _log_collection_sources(all_papers)
+            all_papers[i] = Paper(title=p.title, authors=p.authors, journal=p.journal, url=p.url, source=p.source, published_date=p.published_date, abstract=p.abstract, full_text=p.abstract.strip(), pdf_url=p.pdf_url, work_id=p.work_id, doi=p.doi)
 
     return all_papers
 
