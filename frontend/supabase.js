@@ -16,8 +16,8 @@ const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 // Auth helpers
 // ---------------------------------------------------------------------------
 
-/** Sign up with email + password, storing first/last name in user metadata. */
-async function authSignUp({ email, password, firstName, lastName }) {
+/** Sign up with email + password, storing first/last name + role/bio in user metadata. */
+async function authSignUp({ email, password, firstName, lastName, role, bio }) {
   const { data, error } = await sb.auth.signUp({
     email,
     password,
@@ -25,6 +25,8 @@ async function authSignUp({ email, password, firstName, lastName }) {
       data: {
         first_name: firstName,
         last_name: lastName,
+        role: role || '',
+        bio: bio || '',
       },
     },
   });
@@ -199,6 +201,33 @@ async function fetchDebateById(debateId) {
 
   if (error) { console.error('fetchDebateById:', error); return null; }
   return data;
+}
+
+
+// ---------------------------------------------------------------------------
+// Profile helpers (role + bio)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch the user's profile (role, bio) from the backend API.
+ */
+async function fetchProfileAPI(userId) {
+  const resp = await fetch(`${API_BASE}/api/profile?user_id=${encodeURIComponent(userId)}`);
+  if (!resp.ok) throw new Error(`Profile fetch error: ${resp.status}`);
+  return resp.json();
+}
+
+/**
+ * Update the user's profile (role, bio, first_name, last_name).
+ */
+async function updateProfileAPI(userId, updates) {
+  const resp = await fetch(`${API_BASE}/api/profile`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, ...updates }),
+  });
+  if (!resp.ok) throw new Error(`Profile update error: ${resp.status}`);
+  return resp.json();
 }
 
 

@@ -1,5 +1,10 @@
 {
   "topic": "mechanistic interpretability",
-  "multiplier": 3
+  "candidate_count": 5,
+  "top_k": 5,
+  "debate_rounds": 2,
+  "skip_browserbase": false,
+  "anthropic_api_key": "",
+  "browserbase_api_key": "",
+  "browserbase_project_id": ""
 }
-

@@ -29,6 +29,31 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(messa
 ATOM = "http://www.w3.org/2005/Atom"
 ARXIV = "http://arxiv.org/schemas/atom"
 
+# --- Browserbase/Stagehand (single config, used in multiple flows) ---
+# Uses: (1) Google + Google Scholar search: open search pages, extract result links (title + url).
+#       (2) bioRxiv: search biorxiv, extract paper links, then visit each page for abstract/fulltext.
+#       (3) S2/OpenAlex enrichment: open paper page -> extract abstract + "View on [journal]" link ->
+#           navigate to publisher -> extract PDF link -> fetch PDF and scrape fulltext.
+# Config is loaded once and reused (get_browserbase_config).
+_BROWSERBASE_CONFIG: tuple[str, str, str] | None = None
+
+
+def get_browserbase_config() -> tuple[str, str, str] | None:
+    """Return (api_key, project_id, model_key) or None if not configured. Cached after first read."""
+    global _BROWSERBASE_CONFIG
+    if _BROWSERBASE_CONFIG is not None:
+        return _BROWSERBASE_CONFIG
+    api_key = (os.environ.get("BROWSERBASE_API_KEY") or "").strip()
+    project_id = (os.environ.get("BROWSERBASE_PROJECT_ID") or "").strip()
+    model_key = (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY") or "").strip()
+    if api_key and project_id and model_key:
+        _BROWSERBASE_CONFIG = (api_key, project_id, model_key)
+        return _BROWSERBASE_CONFIG
+    return None
+
+
+STAGEHAND_MODEL = "anthropic/claude-haiku-4-5"
+
 
 @dataclass
 class Paper:
@@ -42,7 +67,32 @@ class Paper:
     published_date: str | None = None
     abstract: str | None = None
     full_text: str | None = None
-    pdf_url: str | None = None  # set from arXiv API for reliable PDF fetch
+    pdf_url: str | None = None  # set from API for reliable PDF fetch
+    work_id: str | None = None  # OpenAlex work id (e.g. W2741809807) for content.openalex.org PDF
+    doi: str | None = None  # DOI for Unpaywall fallback
+
+
+def _normalize_published_for_db(s: str | None) -> str | None:
+    """Return a value safe for PostgreSQL date: YYYY-MM-DD, or None. Rejects partial values like '2019' by expanding to YYYY-01-01."""
+    if s is None or not isinstance(s, str):
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    # Already full date
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return s
+    # Year-month only -> first of month
+    m = re.match(r"^(\d{4})-(\d{1,2})$", s)
+    if m:
+        y, mon = m.group(1), m.group(2).zfill(2)
+        if 1 <= int(mon) <= 12:
+            return f"{y}-{mon}-01"
+    # Year only -> first of year (avoids 'invalid input syntax for type date: "2019"')
+    if re.match(r"^\d{4}$", s):
+        return f"{s}-01-01"
+    # Unparseable -> None to avoid breaking Supabase
+    return None
 
 
 def _sanitize_for_db(s: str | None) -> str | None:
@@ -54,12 +104,12 @@ def _sanitize_for_db(s: str | None) -> str | None:
     return "".join(c for c in s if c != "\x00" and (ord(c) >= 32 or c in "\n\r\t"))
 
 
-def fetch_arxiv(query: str, max_results: int = 20) -> list[Paper]:
-    """Query the free arXiv API; results are requested newest-first by submission date. Retries on 429/503 with backoff."""
+def fetch_arxiv(query: str, max_results: int = 20, start: int = 0) -> list[Paper]:
+    """Query the free arXiv API; results are requested newest-first. Use start for pagination."""
     papers: list[Paper] = []
     params = {
         "search_query": f"all:{query}",
-        "start": 0,
+        "start": start,
         "max_results": max_results,
         "sortBy": "submittedDate",
         "sortOrder": "descending",
@@ -67,23 +117,25 @@ def fetch_arxiv(query: str, max_results: int = 20) -> list[Paper]:
     url = "https://export.arxiv.org/api/query"
     headers = {"User-Agent": "arxiv-py/1.0 (https://arxiv.org/help/api)"}
     resp = None
+    timeout = 60
     for attempt in range(3):
-        resp = requests.get(url, params=params, timeout=30, headers=headers)
+        try:
+            resp = requests.get(url, params=params, timeout=timeout, headers=headers)
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
+            logger.warning("arXiv API timeout (attempt %d/3): %s", attempt + 1, e)
+            if attempt == 2:
+                return papers
+            time.sleep(2 * (attempt + 1))
+            continue
         if resp.status_code in (429, 503):
             wait = (5, 15, 30)[min(attempt, 2)]
-            logger.warning(
-                "arXiv API rate limit (429/503); waiting %ds before retry %d/3.",
-                wait,
-                attempt + 1,
-            )
+            logger.warning("arXiv API rate limit (429/503); waiting %ds before retry %d/3.", wait, attempt + 1)
             time.sleep(wait)
             continue
         resp.raise_for_status()
         break
     if resp is None or resp.status_code in (429, 503):
-        if resp is not None:
-            resp.raise_for_status()
-        raise RuntimeError("arXiv API rate limit: try again in a few minutes.")
+        return papers
 
     root = ET.fromstring(resp.content)
 
@@ -158,12 +210,12 @@ def _openalex_abstract_from_inverted_index(inv: dict[str, list[int]]) -> str | N
     return " ".join(p[1] for p in pairs).strip() or None
 
 
-def fetch_openalex(query: str, max_results: int = 20) -> list[Paper]:
-    """Query OpenAlex works API; returns papers with title, authors, journal, abstract, url. No auth required (optional mailto for polite pool)."""
+def fetch_openalex(query: str, max_results: int = 20, page: int = 1) -> list[Paper]:
+    """Query OpenAlex works API; returns papers with title, authors, journal, abstract, url. Use page for pagination."""
     papers: list[Paper] = []
     per_page = min(200, max(1, max_results))
     url = "https://api.openalex.org/works"
-    params = {"search": query, "per-page": per_page, "sort": "relevance_score:desc"}
+    params = {"search": query, "per-page": per_page, "sort": "relevance_score:desc", "page": page}
     mailto = (os.environ.get("OPENALEX_MAILTO") or "").strip()
     if mailto:
         params["mailto"] = mailto
@@ -203,14 +255,22 @@ def fetch_openalex(query: str, max_results: int = 20) -> list[Paper]:
         abstract = None
         if w.get("abstract_inverted_index") and isinstance(w["abstract_inverted_index"], dict):
             abstract = _openalex_abstract_from_inverted_index(w["abstract_inverted_index"])
-        work_id = (w.get("id") or "").strip()
+        raw_id = (w.get("id") or "").strip()
+        work_id = None
+        if raw_id and "/" in raw_id:
+            work_id = raw_id.rstrip("/").split("/")[-1]  # e.g. https://openalex.org/W2741809807 -> W2741809807
+        elif raw_id:
+            work_id = raw_id
         if work_id and work_id.startswith("http"):
             paper_url = work_id
         elif work_id:
             paper_url = f"https://openalex.org/{work_id}"
         else:
-            doi = (w.get("doi") or "").strip().replace("https://doi.org/", "")
-            paper_url = f"https://doi.org/{doi}" if doi else ""
+            doi_raw = (w.get("doi") or "").strip().replace("https://doi.org/", "").replace("http://doi.org/", "")
+            paper_url = f"https://doi.org/{doi_raw}" if doi_raw else ""
+        doi_for_paper = (w.get("doi") or "").strip()
+        if doi_for_paper:
+            doi_for_paper = doi_for_paper.replace("https://doi.org/", "").replace("http://doi.org/", "").strip()
         pdf_url = None
         content_url = (w.get("content_url") or "").strip()
         oa_key = (os.environ.get("OPENALEX_API_KEY") or "").strip()
@@ -219,6 +279,8 @@ def fetch_openalex(query: str, max_results: int = 20) -> list[Paper]:
             if oa_key:
                 pdf_url += "?" if "?" not in pdf_url else "&"
                 pdf_url += f"api_key={oa_key}"
+        if not pdf_url and work_id and oa_key:
+            pdf_url = f"https://content.openalex.org/works/{work_id}.pdf?api_key={oa_key}"
         if not pdf_url and isinstance(w.get("primary_location"), dict):
             pdf_url = (w["primary_location"].get("pdf_url") or "").strip() or None
         if not pdf_url and isinstance(w.get("best_oa_location"), dict):
@@ -241,31 +303,66 @@ def fetch_openalex(query: str, max_results: int = 20) -> list[Paper]:
                     published_date=pub_date,
                     abstract=abstract,
                     pdf_url=pdf_url,
+                    work_id=work_id,
+                    doi=doi_for_paper or None,
                 )
             )
     return papers
 
 
-def fetch_semantic_scholar(query: str, max_results: int = 20) -> list[Paper]:
-    """Query Semantic Scholar paper search API; returns papers with title, authors, journal, abstract, url."""
+def fetch_semantic_scholar(query: str, max_results: int = 20, offset: int = 0) -> list[Paper]:
+    """Query Semantic Scholar paper search API; returns papers. Use offset for pagination."""
     papers: list[Paper] = []
     limit = min(100, max(1, max_results))
     url = "https://api.semanticscholar.org/graph/v1/paper/search"
     params = {
         "query": query,
         "limit": limit,
+        "offset": offset,
         "fields": "title,url,abstract,authors,year,publicationDate,venue,externalIds,openAccessPdf",
     }
     headers = {"User-Agent": "research-harness/1.0"}
     key = (os.environ.get("SEMANTIC_SCHOLAR_API_KEY") or "").strip()
     if key:
         headers["x-api-key"] = key
-    try:
-        r = requests.get(url, params=params, timeout=30, headers=headers)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        logger.warning("Semantic Scholar API error: %s", e)
+    last_err: Exception | None = None
+    for attempt in range(4):
+        try:
+            r = requests.get(url, params=params, timeout=30, headers=headers)
+            if r.status_code == 429:
+                wait = (2 ** attempt) + 2
+                logger.warning("Semantic Scholar rate limit (429); waiting %ds before retry %d/4.", wait, attempt + 1)
+                time.sleep(wait)
+                last_err = None
+                continue
+            if r.status_code in (503, 502):
+                wait = (2 ** attempt) + 1
+                logger.warning("Semantic Scholar temporary error %s; waiting %ds before retry %d/4.", r.status_code, wait, attempt + 1)
+                time.sleep(wait)
+                last_err = None
+                continue
+            r.raise_for_status()
+            data = r.json()
+            last_err = None
+            break
+        except requests.exceptions.HTTPError as e:
+            last_err = e
+            if e.response is not None and e.response.status_code in (429, 503, 502):
+                wait = (2 ** attempt) + 2
+                logger.warning("Semantic Scholar HTTP %s; waiting %ds before retry %d/4.", e.response.status_code, wait, attempt + 1)
+                time.sleep(wait)
+                continue
+            logger.warning("Semantic Scholar API error: %s", e)
+            return papers
+        except Exception as e:
+            last_err = e
+            logger.warning("Semantic Scholar API error: %s", e)
+            return papers
+    else:
+        if last_err:
+            logger.warning("Semantic Scholar API error after retries: %s", last_err)
+        return papers
+    if last_err is not None:
         return papers
     results = data.get("data") if isinstance(data, dict) else None
     if not isinstance(results, list):
@@ -298,6 +395,10 @@ def fetch_semantic_scholar(query: str, max_results: int = 20) -> list[Paper]:
         oa = p.get("openAccessPdf")
         if isinstance(oa, dict) and (oa.get("url") or "").strip():
             pdf_url = (oa.get("url") or "").strip()
+        doi_for_paper = None
+        ext = p.get("externalIds")
+        if isinstance(ext, dict) and ext.get("DOI"):
+            doi_for_paper = (ext.get("DOI") or "").strip().replace("https://doi.org/", "").replace("http://doi.org/", "")
         if title and paper_url:
             papers.append(
                 Paper(
@@ -309,9 +410,51 @@ def fetch_semantic_scholar(query: str, max_results: int = 20) -> list[Paper]:
                     published_date=pub_date or None,
                     abstract=abstract,
                     pdf_url=pdf_url,
+                    doi=doi_for_paper,
                 )
             )
     return papers
+
+
+def _extract_doi_from_url(url: str | None) -> str | None:
+    """Extract DOI from a doi.org URL (e.g. https://doi.org/10.1234/foo -> 10.1234/foo)."""
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip()
+    for prefix in ("https://doi.org/", "http://doi.org/"):
+        if url.lower().startswith(prefix):
+            return url[len(prefix) :].strip().rstrip("/")
+    return None
+
+
+def _get_pdf_url_from_unpaywall(doi: str | None) -> str | None:
+    """Return a direct PDF URL for the given DOI from Unpaywall API, or None."""
+    if not doi or not isinstance(doi, str):
+        return None
+    doi = doi.strip().replace("https://doi.org/", "").replace("http://doi.org/", "").strip()
+    if not doi:
+        return None
+    email = (os.environ.get("UNPAYWALL_EMAIL") or os.environ.get("OPENALEX_MAILTO") or "research@example.com").strip()
+    url = f"https://api.unpaywall.org/v2/{urllib.parse.quote(doi, safe='')}?email={urllib.parse.quote(email)}"
+    try:
+        r = requests.get(url, timeout=10, headers={"User-Agent": "research-harness/1.0"})
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    best = data.get("best_oa_location")
+    if isinstance(best, dict) and (best.get("url_for_pdf") or best.get("url")):
+        u = (best.get("url_for_pdf") or best.get("url") or "").strip()
+        if u and u.startswith("http"):
+            return u
+    for loc in data.get("oa_locations") or []:
+        if isinstance(loc, dict) and (loc.get("url_for_pdf") or (loc.get("url") and "pdf" in (loc.get("url") or "").lower())):
+            u = (loc.get("url_for_pdf") or loc.get("url") or "").strip()
+            if u and u.startswith("http"):
+                return u
+    return None
 
 
 def _get_pdf_url_from_page(page_url: str) -> str | None:
@@ -341,99 +484,117 @@ def _get_pdf_url_from_page(page_url: str) -> str | None:
     return None
 
 
-def _fetch_semantic_scholar_pdf_fulltext(paper: Paper) -> Paper:
-    """
-    Fetch full text for a Semantic Scholar paper: use pdf_url from API (openAccessPdf) if set,
-    else try to scrape the article page for a PDF link, then download and extract text.
-    """
-    if paper.source != "semantic_scholar" or not paper.url:
-        return paper
-    pdf_url = getattr(paper, "pdf_url", None) or _get_pdf_url_from_page(paper.url)
+def _download_pdf_and_extract_text(
+    pdf_url: str,
+    paper: Paper,
+    source_label: str,
+    headers: dict | None = None,
+) -> str | None:
+    """Download PDF from pdf_url, extract text. Return full_text or None."""
     if not pdf_url or not pdf_url.startswith("http"):
-        logger.debug("No PDF URL for Semantic Scholar paper: %s", paper.url[:50])
-        return paper
+        return None
     if pdf_url.startswith("http://"):
         pdf_url = "https://" + pdf_url[7:]
+    h = headers or {"User-Agent": "research-harness/1.0"}
     try:
-        r = requests.get(
-            pdf_url,
-            timeout=60,
-            headers={"User-Agent": "research-harness/1.0 (https://www.semanticscholar.org)"},
-        )
+        r = requests.get(pdf_url, timeout=60, headers=h)
         r.raise_for_status()
         pdf_bytes = r.content
         if len(pdf_bytes) < 200:
-            return paper
-        if not pdf_bytes.startswith(b"%PDF") and "application/pdf" not in (r.headers.get("Content-Type") or "").lower():
-            logger.debug("Semantic Scholar response may not be PDF: %s", pdf_url[:60])
-            return paper
+            return None
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if not pdf_bytes.startswith(b"%PDF") and "application/pdf" not in ct:
+            return None
     except Exception as e:
-        logger.debug("Could not fetch Semantic Scholar PDF %s: %s", pdf_url[:60], e)
-        return paper
+        logger.debug("Could not fetch PDF %s (%s): %s", pdf_url[:60], source_label, e)
+        return None
     full_text = _extract_text_from_pdf_bytes(pdf_bytes)
     if full_text:
         full_text = full_text.strip()
-    if full_text:
-        logger.info("Extracted %d chars full text from Semantic Scholar PDF: %s", len(full_text), paper.url[:50])
-        return Paper(
-            title=paper.title,
-            authors=paper.authors,
-            journal=paper.journal,
-            url=paper.url,
-            source=paper.source,
-            published_date=paper.published_date,
-            abstract=paper.abstract,
-            full_text=full_text,
-            pdf_url=getattr(paper, "pdf_url", None),
-        )
+    return full_text or None
+
+
+def _fetch_semantic_scholar_pdf_fulltext(paper: Paper) -> Paper:
+    """
+    Fetch full text for a Semantic Scholar paper. Tries in order: API pdf_url (openAccessPdf),
+    Unpaywall by DOI, then scrape the article page for a PDF link. Downloads and extracts text from first working PDF.
+    """
+    if paper.source != "semantic_scholar" or not paper.url:
+        return paper
+    candidates: list[tuple[str, str]] = []
+    if paper.pdf_url and paper.pdf_url.strip():
+        candidates.append((paper.pdf_url.strip(), "openAccessPdf"))
+    doi = paper.doi or _extract_doi_from_url(paper.url)
+    if doi:
+        u = _get_pdf_url_from_unpaywall(doi)
+        if u and not any(c[0] == u for c in candidates):
+            candidates.append((u, "Unpaywall"))
+    page_pdf = _get_pdf_url_from_page(paper.url)
+    if page_pdf and not any(c[0] == page_pdf for c in candidates):
+        candidates.append((page_pdf, "page scrape"))
+    headers = {"User-Agent": "research-harness/1.0 (https://www.semanticscholar.org)"}
+    for pdf_url, label in candidates:
+        full_text = _download_pdf_and_extract_text(pdf_url, paper, label, headers)
+        if full_text:
+            logger.info("Extracted %d chars full text from Semantic Scholar PDF (%s): %s", len(full_text), label, paper.url[:50])
+            return Paper(
+                title=paper.title,
+                authors=paper.authors,
+                journal=paper.journal,
+                url=paper.url,
+                source=paper.source,
+                published_date=paper.published_date,
+                abstract=paper.abstract,
+                full_text=full_text,
+                pdf_url=paper.pdf_url,
+                doi=paper.doi,
+            )
+    logger.warning("No full text found for Semantic Scholar paper (tried %d PDF sources): %s", len(candidates), paper.url[:50])
     return paper
 
 
 def _fetch_openalex_pdf_fulltext(paper: Paper) -> Paper:
     """
-    Fetch full text for an OpenAlex paper: use pdf_url from API (primary_location/best_oa_location/open_access)
-    if set, else scrape the work page for a PDF link, then download and extract text.
+    Fetch full text for an OpenAlex paper. Tries in order: API pdf_url, OpenAlex content URL (work_id + api_key),
+    Unpaywall by DOI, location pdf_urls, then scrape the work page. Downloads and extracts text from first working PDF.
     """
     if paper.source != "openalex" or not paper.url:
         return paper
-    pdf_url = getattr(paper, "pdf_url", None) or _get_pdf_url_from_page(paper.url)
-    if not pdf_url or not pdf_url.startswith("http"):
-        logger.debug("No PDF URL for OpenAlex paper: %s", paper.url[:50])
-        return paper
-    if pdf_url.startswith("http://"):
-        pdf_url = "https://" + pdf_url[7:]
-    try:
-        r = requests.get(
-            pdf_url,
-            timeout=60,
-            headers={"User-Agent": "research-harness/1.0 (https://openalex.org)"},
-        )
-        r.raise_for_status()
-        pdf_bytes = r.content
-        if len(pdf_bytes) < 200:
-            return paper
-        if not pdf_bytes.startswith(b"%PDF") and "application/pdf" not in (r.headers.get("Content-Type") or "").lower():
-            logger.debug("OpenAlex response may not be PDF: %s", pdf_url[:60])
-            return paper
-    except Exception as e:
-        logger.debug("Could not fetch OpenAlex PDF %s: %s", pdf_url[:60], e)
-        return paper
-    full_text = _extract_text_from_pdf_bytes(pdf_bytes)
-    if full_text:
-        full_text = full_text.strip()
-    if full_text:
-        logger.info("Extracted %d chars full text from OpenAlex PDF: %s", len(full_text), paper.url[:50])
-        return Paper(
-            title=paper.title,
-            authors=paper.authors,
-            journal=paper.journal,
-            url=paper.url,
-            source=paper.source,
-            published_date=paper.published_date,
-            abstract=paper.abstract,
-            full_text=full_text,
-            pdf_url=getattr(paper, "pdf_url", None),
-        )
+    candidates: list[tuple[str, str]] = []
+    if paper.pdf_url and paper.pdf_url.strip():
+        candidates.append((paper.pdf_url.strip(), "API"))
+    oa_key = (os.environ.get("OPENALEX_API_KEY") or "").strip()
+    if paper.work_id and oa_key:
+        content_url = f"https://content.openalex.org/works/{paper.work_id}.pdf?api_key={oa_key}"
+        if not any(c[0] == content_url for c in candidates):
+            candidates.append((content_url, "OpenAlex content"))
+    doi = paper.doi or _extract_doi_from_url(paper.url)
+    if doi:
+        u = _get_pdf_url_from_unpaywall(doi)
+        if u and not any(c[0] == u for c in candidates):
+            candidates.append((u, "Unpaywall"))
+    page_pdf = _get_pdf_url_from_page(paper.url)
+    if page_pdf and not any(c[0] == page_pdf for c in candidates):
+        candidates.append((page_pdf, "page scrape"))
+    headers = {"User-Agent": "research-harness/1.0 (https://openalex.org)"}
+    for pdf_url, label in candidates:
+        full_text = _download_pdf_and_extract_text(pdf_url, paper, label, headers)
+        if full_text:
+            logger.info("Extracted %d chars full text from OpenAlex PDF (%s): %s", len(full_text), label, paper.url[:50])
+            return Paper(
+                title=paper.title,
+                authors=paper.authors,
+                journal=paper.journal,
+                url=paper.url,
+                source=paper.source,
+                published_date=paper.published_date,
+                abstract=paper.abstract,
+                full_text=full_text,
+                pdf_url=paper.pdf_url,
+                work_id=paper.work_id,
+                doi=paper.doi,
+            )
+    logger.warning("No full text found for OpenAlex paper (tried %d PDF sources): %s", len(candidates), paper.url[:50])
     return paper
 
 
@@ -642,6 +803,71 @@ def _summarize_paragraph_to_topic(paragraph: str) -> str:
     return paragraph[:200].strip() or paragraph
 
 
+def _normalize_url_for_match(u: str) -> str:
+    u = (u or "").strip().rstrip("/")
+    if u.startswith("http://"):
+        u = "https://" + u[7:]
+    return u
+
+
+def _canonical_paper_id(p: Paper) -> str:
+    """Unique id for deduping: same paper from different sources counts as one. Prefer DOI else normalized URL."""
+    if p.doi and p.doi.strip():
+        return ("doi:" + p.doi.strip().lower()).replace("https://doi.org/", "").replace("http://doi.org/", "")
+    return _normalize_url_for_match(p.url or "")
+
+
+def _filter_directly_relevant(topic: str, papers: list[Paper]) -> list[Paper]:
+    """
+    Preprocessing: Claude keeps ONLY papers that are DIRECTLY about the topic.
+    Discards tangential, minor mention, or unrelated. Returns subset of papers.
+    """
+    if not papers:
+        return []
+    anthropic_key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    if not anthropic_key:
+        return papers
+
+    model = (os.environ.get("FILTER_LLM_MODEL") or "").strip() or "claude-haiku-4-5"
+    lines: list[str] = []
+    for i, p in enumerate(papers, 1):
+        abst = (p.abstract or "(no abstract)")[:800].strip()
+        lines.append(f"[{i}] URL: {p.url}\nTitle: {p.title}\nAbstract: {abst}\n")
+    block = "\n".join(lines)
+    user_content = (
+        f'Research topic: "{topic}"\n\n'
+        "Below are candidate papers. Keep ONLY papers that are DIRECTLY and primarily about this topic. "
+        "Discard papers that are only tangentially related, mention the topic in passing, or are not actually about the topic. "
+        "Return a JSON array of the URLs of papers to KEEP (only directly relevant ones). Use only URLs from the list. "
+        "Return nothing else — only a JSON array of URL strings.\n\n"
+        f"{block}"
+    )
+    try:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=anthropic_key)
+        resp = client.messages.create(
+            model=model,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": user_content}],
+        )
+        text = (resp.content[0].text if resp.content else "").strip()
+        if "```" in text:
+            text = re.sub(r"^.*?```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```.*$", "", text, flags=re.DOTALL)
+        text = text.strip()
+        urls = json.loads(text)
+        if not isinstance(urls, list):
+            return papers
+        keep_urls = {_normalize_url_for_match(u) for u in urls if isinstance(u, str) and (u or "").strip()}
+        by_normalized = {_normalize_url_for_match(p.url): p for p in papers}
+        filtered = [by_normalized[nu] for nu in keep_urls if nu in by_normalized]
+        logger.info("Direct-relevance filter: %d papers kept from %d candidates.", len(filtered), len(papers))
+        return filtered
+    except Exception as e:
+        logger.warning("Direct-relevance filter failed: %s. Keeping all candidates.", e)
+        return papers
+
+
 def _filter_papers_with_llm(topic: str, papers: list[Paper], top_k: int) -> list[Paper]:
     """
     Use Claude (Anthropic) to select the best top_k papers from the combined candidate list.
@@ -698,7 +924,30 @@ def _filter_papers_with_llm(topic: str, papers: list[Paper], top_k: int) -> list
             return papers[:top_k]
         url_order = [u for u in urls if isinstance(u, str) and u.strip()]
         by_url = {p.url: p for p in papers}
-        filtered = [by_url[u] for u in url_order if u in by_url][:top_k]
+        by_url_normalized = {_normalize_url_for_match(k): p for k, p in by_url.items()}
+        filtered: list[Paper] = []
+        seen_canonical: set[str] = set()
+        for u in url_order:
+            if len(filtered) >= top_k:
+                break
+            nu = _normalize_url_for_match(u)
+            p = by_url.get(u) or by_url_normalized.get(nu)
+            if not p:
+                continue
+            cid = _canonical_paper_id(p)
+            if cid in seen_canonical:
+                continue
+            filtered.append(p)
+            seen_canonical.add(cid)
+        if len(filtered) < top_k:
+            for p in papers:
+                if len(filtered) >= top_k:
+                    break
+                cid = _canonical_paper_id(p)
+                if cid in seen_canonical:
+                    continue
+                filtered.append(p)
+                seen_canonical.add(cid)
         logger.info("Anthropic filter: selected %d best papers from %d candidates.", len(filtered), len(papers))
         return filtered if filtered else papers[:top_k]
     except Exception as e:
@@ -731,22 +980,8 @@ def _filter_recency(papers: list[Paper], max_age_months: int) -> list[Paper]:
 
 
 def _sort_papers_by_date(papers: list[Paper]) -> list[Paper]:
-    """Sort papers by publication date (newest first). Papers without date go last."""
-    with_date: list[Paper] = []
-    without_date: list[Paper] = []
-    for p in papers:
-        if p.published_date:
-            with_date.append(p)
-        else:
-            without_date.append(p)
-    with_date.sort(key=lambda p: p.published_date or "", reverse=True)
-    result = with_date + without_date
-    logger.info(
-        "Prioritizing by publication date (newest first): %d papers with date, %d without.",
-        len(with_date),
-        len(without_date),
-    )
-    return result
+    """Sort by publication date (newest first). No date sorts last."""
+    return sorted(papers, key=lambda p: (p.published_date or ""), reverse=True)
 
 
 async def _scrape_paper_metadata(session: Any, paper: Paper, source: str) -> Paper:
@@ -830,22 +1065,128 @@ async def _scrape_paper_metadata(session: Any, paper: Paper, source: str) -> Pap
     return paper
 
 
+async def _enrich_papers_with_browser(all_papers: list[Paper], indices: list[int]) -> None:
+    """
+    Use Browserbase to enrich S2/OpenAlex papers: navigate to paper page -> find abstract and
+    "View on [journal]" link -> navigate to publisher -> find PDF link -> fetch PDF and scrape fulltext.
+    Updates all_papers in place.
+    """
+    if not indices:
+        return
+    config = get_browserbase_config()
+    if not config:
+        return
+    api_key, project_id, model_key = config
+    try:
+        from stagehand import AsyncStagehand
+    except ImportError:
+        return
+    schema = {
+        "type": "object",
+        "properties": {
+            "abstract": {"type": "string"},
+            "pdf_url": {"type": "string"},
+            "view_on_journal_url": {"type": "string"},
+            "full_text": {"type": "string"},
+        },
+        "additionalProperties": True,
+    }
+    page_instruction = (
+        "This is an academic paper page (e.g. Semantic Scholar or OpenAlex). "
+        "Extract: (1) abstract - full abstract/summary if visible; "
+        "(2) view_on_journal_url - the href of any link like 'View on [journal]', 'Publisher', 'Full text', or link to the journal/publisher site; "
+        "(3) pdf_url - direct URL to a PDF if there is a link or button to PDF on this page. Use null for missing."
+    )
+    publisher_instruction = (
+        "This is a journal or publisher page for an article. Find the direct link to the PDF of the article "
+        "(e.g. 'PDF', 'Download PDF', 'Full text PDF'). Return pdf_url - the href to the PDF, or null if not found."
+    )
+    async with AsyncStagehand(
+        browserbase_api_key=api_key,
+        browserbase_project_id=project_id,
+        model_api_key=model_key,
+    ) as client:
+        session = await client.sessions.start(model_name=STAGEHAND_MODEL)
+        try:
+            for idx in indices:
+                if idx >= len(all_papers):
+                    continue
+                p = all_papers[idx]
+                try:
+                    await session.navigate(url=p.url)
+                    await asyncio.sleep(1.5)
+                except Exception as e:
+                    logger.debug("Browserbase navigate failed for %s: %s", p.url[:50], e)
+                    continue
+                try:
+                    resp = await session.extract(instruction=page_instruction, schema=schema)
+                    data = _get_extract_result(resp)
+                except Exception as e:
+                    logger.debug("Browserbase extract failed for %s: %s", p.url[:50], e)
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                abst = (data.get("abstract") or "").strip() or None
+                pdf_url = (data.get("pdf_url") or "").strip() or None
+                view_url = (data.get("view_on_journal_url") or "").strip() or None
+                full_text = (data.get("full_text") or "").strip() or None
+                if abst and len(abst) > 50:
+                    p = Paper(
+                        title=p.title,
+                        authors=p.authors,
+                        journal=p.journal,
+                        url=p.url,
+                        source=p.source,
+                        published_date=p.published_date,
+                        abstract=abst,
+                        full_text=p.full_text,
+                        pdf_url=p.pdf_url or (pdf_url if pdf_url and pdf_url.startswith("http") else None),
+                        work_id=p.work_id,
+                        doi=p.doi,
+                    )
+                if (view_url and view_url.startswith("http") and (not pdf_url or not pdf_url.startswith("http")) and (not p.full_text or len((p.full_text or "").strip()) < 500)):
+                    try:
+                        await session.navigate(url=view_url)
+                        await asyncio.sleep(1.5)
+                        resp2 = await session.extract(instruction=publisher_instruction, schema={"type": "object", "properties": {"pdf_url": {"type": "string"}}, "additionalProperties": True})
+                        data2 = _get_extract_result(resp2)
+                        if isinstance(data2, dict):
+                            pdf_url = (data2.get("pdf_url") or "").strip() or None
+                    except Exception:
+                        pass
+                if pdf_url and pdf_url.startswith("http") and (not p.full_text or len((p.full_text or "").strip()) < 500):
+                    txt = _download_pdf_and_extract_text(pdf_url, p, "browser", {"User-Agent": "research-harness/1.0"})
+                    if txt and len(txt) > 200:
+                        full_text = txt
+                if full_text and len(full_text) > 200:
+                    p = Paper(
+                        title=p.title,
+                        authors=p.authors,
+                        journal=p.journal,
+                        url=p.url,
+                        source=p.source,
+                        published_date=p.published_date,
+                        abstract=p.abstract,
+                        full_text=full_text,
+                        pdf_url=p.pdf_url,
+                        work_id=p.work_id,
+                        doi=p.doi,
+                    )
+                all_papers[idx] = p
+        finally:
+            await session.end()
+
+
 async def _fetch_biorxiv_stagehand(topic: str, max_results: int = 25) -> list[Paper]:
     """
-    Use Stagehand (Browserbase + AI) to open bioRxiv search, extract relevant papers,
-    then visit each paper page to scrape published_date, abstract, and full_text.
-    Returns up to max_results papers with metadata populated.
+    Use Browserbase/Stagehand to open bioRxiv search, extract papers, then visit each page
+    to scrape published_date, abstract, and full_text. Uses central Browserbase config.
     """
-    api_key = os.environ.get("BROWSERBASE_API_KEY")
-    project_id = os.environ.get("BROWSERBASE_PROJECT_ID")
-    # Stagehand can use Anthropic for extract; fall back to OpenAI if Stagehand is configured for it
-    model_key = (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY") or "").strip()
-    if not api_key or not project_id or not model_key:
-        logger.info(
-            "Skipping bioRxiv: set BROWSERBASE_API_KEY, BROWSERBASE_PROJECT_ID, and ANTHROPIC_API_KEY to enable."
-        )
+    config = get_browserbase_config()
+    if not config:
+        logger.info("Skipping bioRxiv: set BROWSERBASE_*, BROWSERBASE_PROJECT_ID, and ANTHROPIC_API_KEY.")
         return []
-
+    api_key, project_id, model_key = config
     try:
         from stagehand import AsyncStagehand
     except ImportError:
@@ -864,7 +1205,7 @@ async def _fetch_biorxiv_stagehand(topic: str, max_results: int = 25) -> list[Pa
         browserbase_project_id=project_id,
         model_api_key=model_key,
     ) as client:
-        session = await client.sessions.start(model_name="anthropic/claude-haiku-4-5")
+        session = await client.sessions.start(model_name=STAGEHAND_MODEL)
         try:
             await session.navigate(url=search_url)
             extract_response = await session.extract(
@@ -923,30 +1264,50 @@ async def _fetch_biorxiv_stagehand(topic: str, max_results: int = 25) -> list[Pa
 
 
 def _get_extract_result(extract_response: Any) -> Any:
-    """Get the extracted result from Stagehand extract() response; handles .data.result or .result."""
+    """Get the extracted result from Stagehand extract(); handles .data.result, .result, or JSON string."""
     if extract_response is None:
         return None
     raw = getattr(extract_response, "data", None)
     if raw is not None and hasattr(raw, "result"):
-        return getattr(raw, "result", None)
-    return getattr(extract_response, "result", None)
+        out = getattr(raw, "result", None)
+    else:
+        out = getattr(extract_response, "result", None)
+    if out is None:
+        for attr in ("output", "content", "text"):
+            out = getattr(extract_response, attr, None) or (getattr(raw, attr, None) if raw is not None else None)
+            if out is not None:
+                break
+    if isinstance(out, str) and out.strip():
+        s = out.strip()
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError:
+            pass
+    return out
 
 
 def _unwrap_extract_list(result: Any) -> list:
-    """Return a list from Stagehand extract result; handles list or dict with result/items/data."""
+    """Return a list of search result items from Stagehand extract; handles list, dict, or nested JSON."""
     if result is None:
         return []
     if isinstance(result, list):
         return result
     if isinstance(result, dict):
-        for key in ("result", "items", "data", "papers", "links", "results"):
+        for key in (
+            "result", "items", "data", "papers", "links", "results",
+            "search_results", "entries", "organic_results", "searchResults",
+        ):
             val = result.get(key)
             if isinstance(val, list):
                 return val
-        if result:
-            first_val = next(iter(result.values()), None)
-            if isinstance(first_val, list):
-                return first_val
+            if isinstance(val, str) and val.strip().startswith("["):
+                try:
+                    return json.loads(val)
+                except json.JSONDecodeError:
+                    pass
+        for val in result.values():
+            if isinstance(val, list) and val:
+                return val
     return []
 
 
@@ -969,24 +1330,45 @@ def _normalize_search_url(url: str) -> str | None:
 
 
 def _parse_search_results(result: Any, max_results: int) -> list[Paper]:
-    """Parse extract result into list of Paper; dedupe by URL; cap at max_results. Lenient on keys and title."""
+    """Parse extract result into list of Paper; dedupe by URL; cap at max_results. Very lenient on keys."""
     papers: list[Paper] = []
     seen: set[str] = set()
     items = _unwrap_extract_list(result)
+    url_keys = ("url", "link", "href", "sourceUrl", "citationUrl", "pdfLink", "link_url", "result_url", "source")
+    title_keys = ("title", "text", "name", "headline", "citation", "snippet")
     for item in items:
         if len(papers) >= max_results:
             break
-        if not isinstance(item, dict):
+        url_raw = ""
+        title = ""
+        if isinstance(item, dict):
+            for k in url_keys:
+                v = item.get(k)
+                if not isinstance(v, str) or not v.strip():
+                    continue
+                v = v.strip()
+                if v.startswith("http://") or v.startswith("https://"):
+                    url_raw = v
+                    break
+                if not url_raw:
+                    url_raw = v
+            for k in title_keys:
+                v = item.get(k)
+                if isinstance(v, str) and v.strip():
+                    title = v.strip()
+                    break
+            authors_str = item.get("authors") or item.get("author") or ""
+        elif isinstance(item, str) and item.strip().startswith("http"):
+            url_raw = item.strip()
+            authors_str = ""
+        else:
             continue
-        url_raw = (item.get("url") or item.get("link") or item.get("href") or "").strip()
         url = _normalize_search_url(url_raw)
         if not url or url in seen:
             continue
-        title = (item.get("title") or item.get("text") or item.get("name") or "").strip()
         if not title:
             title = url[:80] + ("..." if len(url) > 80 else "")
         seen.add(url)
-        authors_str = item.get("authors") or ""
         authors_list = [a.strip() for a in authors_str.split(",") if a.strip()] if authors_str else []
         papers.append(Paper(title=title, authors=authors_list, journal="", url=url, source="internet"))
     return papers
@@ -995,27 +1377,32 @@ def _parse_search_results(result: Any, max_results: int) -> list[Paper]:
 async def _fetch_internet_stagehand(topic: str, max_results: int = 25) -> list[Paper]:
     """
     Fetch up to max_results internet candidates: Google Search first, Google Scholar fallback if 0.
-    Then scrape each page for title, authors, date, abstract so Claude can consider them.
+    Then scrape each page for title, authors, date, abstract. Uses central Browserbase config.
     """
-    api_key = os.environ.get("BROWSERBASE_API_KEY")
-    project_id = os.environ.get("BROWSERBASE_PROJECT_ID")
-    model_key = (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY") or "").strip()
-    if not api_key or not project_id or not model_key:
+    config = get_browserbase_config()
+    if not config:
         logger.info("Browserbase/Stagehand not configured; skipping internet. Set BROWSERBASE_* and ANTHROPIC_API_KEY.")
         return []
-
+    api_key, project_id, model_key = config
     try:
         from stagehand import AsyncStagehand
     except ImportError:
         logger.warning("Stagehand not installed; run pip install stagehand. Skipping internet search.")
         return []
 
+    # Permissive schema to avoid 422 "response did not match schema" when LLM returns link/href or partial objects
     search_schema = {
         "type": "array",
         "items": {
             "type": "object",
-            "properties": {"title": {"type": "string"}, "url": {"type": "string"}, "authors": {"type": "string"}},
-            "required": ["title", "url"],
+            "properties": {
+                "title": {"type": "string"},
+                "url": {"type": "string"},
+                "link": {"type": "string"},
+                "href": {"type": "string"},
+                "authors": {"type": "string"},
+            },
+            "additionalProperties": True,
         },
     }
     query_google = f"{topic} research paper"
@@ -1028,21 +1415,39 @@ async def _fetch_internet_stagehand(topic: str, max_results: int = 25) -> list[P
         browserbase_project_id=project_id,
         model_api_key=model_key,
     ) as client:
-        session = await client.sessions.start(model_name="anthropic/claude-haiku-4-5")
+        session = await client.sessions.start(model_name=STAGEHAND_MODEL)
         try:
             # 1) Google Search first
             await session.navigate(url=f"https://www.google.com/search?q={encoded_google}")
             await asyncio.sleep(2.0)
-            extract_response = await session.extract(
-                instruction=(
-                    f"This is a Google search results page for \"{query_google}\". "
-                    f"List the main search results (organic results, not ads). For each result extract: "
-                    f"title (the blue headline/link text), url (the full href of the link - use the actual destination URL if you see a redirect). "
-                    f"Include articles, papers, .edu, .org, journals, PDFs. Return a JSON array of objects with keys title and url (and authors if visible). "
-                    f"Extract as many results as you see, up to {max_results}."
-                ),
-                schema=search_schema,
-            )
+            extract_response = None
+            try:
+                extract_response = await session.extract(
+                    instruction=(
+                        f"This is a Google search results page for \"{query_google}\". "
+                        f"List the main search results (organic results, not ads). For each result extract: "
+                        f"title (the blue headline/link text), url (the full href of the link - use the actual destination URL if you see a redirect). "
+                        f"Include articles, papers, .edu, .org, journals, PDFs. Return a JSON array of objects with keys title and url (and authors if visible). "
+                        f"Extract as many results as you see, up to {max_results}."
+                    ),
+                    schema=search_schema,
+                )
+            except Exception as extract_err:
+                err_str = str(extract_err)
+                if "422" in err_str or "did not match schema" in err_str.lower():
+                    logger.info("Google extract schema mismatch (422), retrying with array-only instruction.")
+                    try:
+                        extract_response = await session.extract(
+                            instruction=(
+                                "You are on a Google search results page. Output ONLY a JSON array, no other text. "
+                                "Each element is an object with exactly two keys: \"title\" (string, the blue clickable headline) and \"url\" (string, the full destination URL of that link). "
+                                f"Include up to {max_results} organic results, in order. Example: [{{\"title\": \"...\", \"url\": \"https://...\"}}]"
+                            ),
+                        )
+                    except Exception:
+                        pass
+                if extract_response is None:
+                    raise extract_err
             result = _get_extract_result(extract_response)
             papers = _parse_search_results(result, max_results)
             if len(papers) == 0:
@@ -1053,14 +1458,31 @@ async def _fetch_internet_stagehand(topic: str, max_results: int = 25) -> list[P
                 logger.info("Google returned %d; trying Google Scholar fallback.", len(papers))
                 await session.navigate(url=f"https://scholar.google.com/scholar?q={encoded_topic}")
                 await asyncio.sleep(2.0)
-                extract_response = await session.extract(
-                    instruction=(
-                        f"This is a Google Scholar results page for \"{topic}\". "
-                        f"List the search results. For each result extract: title, url (the link to the paper or abstract), authors if visible. "
-                        f"Return a JSON array of objects with keys title and url. Extract as many as you see, up to {max_results}."
-                    ),
-                    schema=search_schema,
-                )
+                extract_response = None
+                try:
+                    extract_response = await session.extract(
+                        instruction=(
+                            f"This is a Google Scholar results page for \"{topic}\". "
+                            f"List the search results. For each result extract: title, url (the link to the paper or abstract), authors if visible. "
+                            f"Return a JSON array of objects with keys title and url. Extract as many as you see, up to {max_results}."
+                        ),
+                        schema=search_schema,
+                    )
+                except Exception as scholar_err:
+                    err_str = str(scholar_err)
+                    if "422" in err_str or "did not match schema" in err_str.lower():
+                        try:
+                            extract_response = await session.extract(
+                                instruction=(
+                                    "You are on a Google Scholar results page. Output ONLY a JSON array, no other text. "
+                                    "Each element is an object with \"title\" (string) and \"url\" (string, the link to the paper or abstract). "
+                                    f"Include up to {max_results} results. Example: [{{\"title\": \"...\", \"url\": \"https://...\"}}]"
+                                ),
+                            )
+                        except Exception:
+                            pass
+                    if extract_response is None:
+                        raise scholar_err
                 result = _get_extract_result(extract_response)
                 scholar_papers = _parse_search_results(result, max_results)
                 if len(scholar_papers) == 0:
@@ -1107,57 +1529,126 @@ async def _fetch_biorxiv_and_internet(prompt: str, candidate_count: int) -> tupl
     return biorxiv_papers, internet_papers
 
 
+ALL_SOURCES = {"arxiv", "biorxiv", "openalex", "semantic_scholar", "internet"}
+
+
+def _fetch_round(
+    prompt: str,
+    sources: set[str],
+    candidate_count: int,
+    round_index: int,
+) -> list[Paper]:
+    """Fetch one round of candidates from enabled sources. round_index 0 = first page, 1 = next page, etc."""
+    start = round_index * candidate_count
+    page = round_index + 1
+    offset = round_index * candidate_count
+
+    arxiv_papers: list[Paper] = []
+    if "arxiv" in sources:
+        try:
+            arxiv_papers = fetch_arxiv(prompt, max_results=candidate_count, start=start)
+            logger.info("arXiv (round %d): %d candidates.", round_index + 1, len(arxiv_papers))
+        except Exception as e:
+            logger.warning("arXiv fetch failed: %s", e)
+
+    openalex_papers: list[Paper] = []
+    if "openalex" in sources:
+        try:
+            openalex_papers = fetch_openalex(prompt, max_results=candidate_count, page=page)
+            logger.info("OpenAlex (round %d): %d candidates.", round_index + 1, len(openalex_papers))
+        except Exception as e:
+            logger.warning("OpenAlex fetch failed: %s", e)
+
+    s2_papers: list[Paper] = []
+    if "semantic_scholar" in sources:
+        try:
+            s2_papers = fetch_semantic_scholar(prompt, max_results=candidate_count, offset=offset)
+            logger.info("Semantic Scholar (round %d): %d candidates.", round_index + 1, len(s2_papers))
+        except Exception as e:
+            logger.warning("Semantic Scholar fetch failed: %s", e)
+
+    biorxiv_papers: list[Paper] = []
+    internet_papers: list[Paper] = []
+    if ("biorxiv" in sources or "internet" in sources) and round_index == 0:
+        try:
+            biorxiv_papers, internet_papers = asyncio.run(_fetch_biorxiv_and_internet(prompt, candidate_count))
+            if "biorxiv" not in sources:
+                biorxiv_papers = []
+            if "internet" not in sources:
+                internet_papers = []
+            logger.info("bioRxiv: %d, internet: %d candidates.", len(biorxiv_papers), len(internet_papers))
+        except Exception as e:
+            logger.warning("Browserbase fetch failed: %s", e)
+
+    combined: list[Paper] = []
+    seen: set[str] = set()
+    for p in arxiv_papers + openalex_papers + s2_papers + biorxiv_papers + internet_papers:
+        if p.url and p.url not in seen:
+            seen.add(p.url)
+            combined.append(p)
+    return combined
+
+
 def run_harness(
     prompt: str,
     candidate_count: int = 50,
     top_k: int = 20,
     max_age_months: int = 0,
+    sources: set[str] | None = None,
 ) -> list[Paper]:
-    """Accumulate candidate_count from each of arXiv, bioRxiv, OpenAlex, Semantic Scholar, and internet; then Claude picks best top_k."""
-    logger.info("Fetching up to %d candidates from each source (arXiv, bioRxiv, OpenAlex, Semantic Scholar, internet).", candidate_count)
-    try:
-        arxiv_papers = fetch_arxiv(prompt, max_results=candidate_count)
-        logger.info("arXiv: %d candidates.", len(arxiv_papers))
-    except Exception as e:
-        raise RuntimeError(f"arXiv API error: {e}") from e
+    """
+    Fetch from enabled sources (default all). Preprocessing: keep only papers DIRECTLY about the topic.
+    If useful papers < top_k, fetch more (next page/offset) and repeat until we have at least top_k or max_rounds.
+    Then rank and select best top_k, fetch fulltext.
 
-    openalex_papers: list[Paper] = []
-    s2_papers: list[Paper] = []
-    try:
-        openalex_papers = fetch_openalex(prompt, max_results=candidate_count)
-        logger.info("OpenAlex: %d candidates.", len(openalex_papers))
-    except Exception as e:
-        logger.warning("OpenAlex fetch failed: %s", e)
-    try:
-        s2_papers = fetch_semantic_scholar(prompt, max_results=candidate_count)
-        logger.info("Semantic Scholar: %d candidates.", len(s2_papers))
-    except Exception as e:
-        logger.warning("Semantic Scholar fetch failed: %s", e)
+    Respects SKIP_BROWSERBASE env var: when set, removes biorxiv and internet from
+    the enabled sources (same behaviour as earlier versions of this harness).
+    """
+    enabled = sources if sources is not None else set(ALL_SOURCES)
 
-    biorxiv_papers: list[Paper] = []
-    internet_papers: list[Paper] = []
-    try:
-        biorxiv_papers, internet_papers = asyncio.run(_fetch_biorxiv_and_internet(prompt, candidate_count))
-        logger.info("bioRxiv: %d, internet: %d candidates.", len(biorxiv_papers), len(internet_papers))
-        if len(biorxiv_papers) == 0 and len(internet_papers) == 0:
-            logger.warning(
-                "No bioRxiv or internet candidates. For web results set BROWSERBASE_API_KEY, BROWSERBASE_PROJECT_ID, ANTHROPIC_API_KEY."
-            )
-    except Exception as e:
-        logger.warning("Browserbase fetch failed: %s. Continuing with API sources only.", e)
+    # Preserve SKIP_BROWSERBASE compatibility from the pipeline / settings page
+    skip_browserbase = os.environ.get("SKIP_BROWSERBASE", "").strip().lower() in ("1", "true", "yes")
+    if skip_browserbase:
+        enabled = enabled - {"biorxiv", "internet"}
+        logger.info("SKIP_BROWSERBASE is set — removing biorxiv & internet from sources.")
 
+    enabled_str = ",".join(sorted(enabled))
+    logger.info("Sources enabled: %s. Fetching up to %d candidates per source per round.", enabled_str, candidate_count)
+
+    all_candidates: list[Paper] = []
     seen_urls: set[str] = set()
-    all_papers: list[Paper] = []
-    for p in arxiv_papers + openalex_papers + s2_papers + biorxiv_papers + internet_papers:
-        if p.url and p.url not in seen_urls:
-            seen_urls.add(p.url)
-            all_papers.append(p)
-    logger.info("Combined %d unique candidates.", len(all_papers))
+    max_rounds = 5
+    useful: list[Paper] = []
 
-    if max_age_months > 0:
-        all_papers = _filter_recency(all_papers, max_age_months)
-    all_papers = _sort_papers_by_date(all_papers)
-    all_papers = _filter_papers_with_llm(prompt, all_papers, top_k)
+    for round_index in range(max_rounds):
+        new_batch = _fetch_round(prompt, enabled, candidate_count, round_index)
+        added = 0
+        for p in new_batch:
+            if p.url and p.url not in seen_urls:
+                seen_urls.add(p.url)
+                all_candidates.append(p)
+                added += 1
+        logger.info("Combined %d unique candidates after round %d.", len(all_candidates), round_index + 1)
+
+        if max_age_months > 0:
+            useful = _filter_recency(all_candidates, max_age_months)
+        else:
+            useful = list(all_candidates)
+        useful = _filter_directly_relevant(prompt, useful)
+
+        if len(useful) >= top_k:
+            logger.info("At least %d directly relevant papers; stopping fetch.", top_k)
+            break
+        if added == 0 and round_index > 0:
+            logger.info("No new papers in round %d; stopping.", round_index + 1)
+            break
+
+    if not useful:
+        useful = all_candidates
+    useful = _sort_papers_by_date(useful)
+    # When we have fewer than top_k directly relevant, let LLM choose from full candidate set so we can still return up to top_k
+    candidate_for_rank = useful if len(useful) >= top_k else _sort_papers_by_date(all_candidates)
+    all_papers = _filter_papers_with_llm(prompt, candidate_for_rank, top_k)
 
     for i, p in enumerate(all_papers):
         if p.source == "arxiv":
@@ -1173,6 +1664,36 @@ def run_harness(
             logger.info("Fetching OpenAlex PDF full text for paper %d/%d: %s", i + 1, len(all_papers), p.url[:50] + "...")
             all_papers[i] = _fetch_openalex_pdf_fulltext(p)
 
+    # Enrich S2/OpenAlex with Browserbase when abstract or fulltext still missing
+    if not skip_browserbase:
+        need_browser: list[int] = [
+            i for i, p in enumerate(all_papers)
+            if p.source in ("semantic_scholar", "openalex")
+            and ((not p.abstract or not (p.abstract or "").strip()) or (not p.full_text or len((p.full_text or "").strip()) < 300))
+        ]
+        if need_browser:
+            try:
+                asyncio.run(_enrich_papers_with_browser(all_papers, need_browser))
+            except Exception as e:
+                logger.warning("Browserbase enrichment for S2/OpenAlex failed: %s", e)
+
+    # When fulltext could not be scraped, use abstract so output is never null when abstract exists
+    for i, p in enumerate(all_papers):
+        if (not (p.full_text or "").strip()) and (p.abstract and p.abstract.strip()):
+            all_papers[i] = Paper(
+                title=p.title,
+                authors=p.authors,
+                journal=p.journal,
+                url=p.url,
+                source=p.source,
+                published_date=p.published_date,
+                abstract=p.abstract,
+                full_text=p.abstract.strip(),
+                pdf_url=p.pdf_url,
+                work_id=p.work_id,
+                doi=p.doi,
+            )
+
     _log_collection_sources(all_papers)
 
     return all_papers
@@ -1186,7 +1707,7 @@ def paper_to_dict(p: Paper, topic: str | None = None) -> dict:
         "topic": _s(topic or ""),
         "paper_name": _s(p.title),
         "paper_authors": authors_safe,
-        "published": _s(p.published_date) if isinstance(p.published_date, str) else p.published_date,
+        "published": _normalize_published_for_db(p.published_date),
         "journal": _s(p.journal),
         "abstract": _sanitize_for_db(p.abstract),
         "fulltext": _sanitize_for_db(p.full_text),
@@ -1209,6 +1730,10 @@ def save_papers_to_supabase(
     if not url or not key:
         logger.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY/SUPABASE_KEY not set; skipping Supabase.")
         return 0
+    if not papers:
+        logger.info("No papers to save to Supabase.")
+        return 0
+    logger.info("Saving %d papers to Supabase table %s.", len(papers), table)
     try:
         from supabase import create_client
     except ImportError:
@@ -1225,7 +1750,7 @@ def save_papers_to_supabase(
                 "topic": _s(topic or ""),
                 "paper_name": _s(p.title),
                 "paper_authors": authors_safe,
-                "published": _s(p.published_date) if isinstance(p.published_date, str) else p.published_date,
+                "published": _normalize_published_for_db(p.published_date),
                 "journal": _s(p.journal),
                 "abstract": _sanitize_for_db(p.abstract),
                 "fulltext": _sanitize_for_db(p.full_text),
@@ -1238,59 +1763,71 @@ def save_papers_to_supabase(
 
     client = create_client(url, key)
     skipped_columns: set[str] = set()
-    max_retries = 5
     use_upsert = True
-    for attempt in range(max_retries):
-        rows = build_rows(skip_columns=skipped_columns)
+    total_upserted = 0
+    failed = 0
+    rows = build_rows(skip_columns=skipped_columns)
+    for idx, row in enumerate(rows):
         try:
-            total_upserted = 0
-            for row in rows:
-                if use_upsert:
-                    client.table(table).upsert([row], on_conflict="url").execute()
-                else:
-                    client.table(table).insert([row]).execute()
-                total_upserted += 1
-            if not use_upsert:
-                logger.warning(
-                    "Table %s has no UNIQUE constraint on url; used INSERT (duplicates possible). Add one: ALTER TABLE %s ADD CONSTRAINT papers_url_key UNIQUE (url);",
-                    table,
-                    table,
-                )
-            if skipped_columns:
-                logger.info(
-                    "Upserted %d papers to Supabase table %s (omitted columns not in table: %s).",
-                    total_upserted,
-                    table,
-                    ", ".join(sorted(skipped_columns)),
-                )
+            if use_upsert:
+                client.table(table).upsert([row], on_conflict="url").execute()
             else:
-                logger.info("Upserted %d papers to Supabase table %s.", total_upserted, table)
-            return total_upserted
+                client.table(table).insert([row]).execute()
+            total_upserted += 1
         except Exception as e:
             err_str = str(e)
             if use_upsert and ("42P10" in err_str or "unique or exclusion constraint" in err_str.lower()):
                 use_upsert = False
                 logger.warning(
-                    "Table %s has no UNIQUE constraint on url; using INSERT instead of upsert. To get upsert-by-url, run: ALTER TABLE %s ADD CONSTRAINT papers_url_key UNIQUE (url);",
+                    "Table %s has no UNIQUE constraint on url; using INSERT for remaining rows. Run: ALTER TABLE %s ADD CONSTRAINT papers_url_key UNIQUE (url);",
                     table,
                     table,
                 )
+                try:
+                    client.table(table).insert([row]).execute()
+                    total_upserted += 1
+                except Exception as e2:
+                    logger.warning("Supabase insert failed for paper %d (url=%s): %s", idx + 1, (row.get("url") or "")[:50], e2)
+                    failed += 1
                 continue
             match = re.search(r"Could not find the ['\"](\w+)['\"] column", err_str)
             if match and ("PGRST204" in err_str or "Could not find" in err_str):
-                col = match.group(1)
-                skipped_columns.add(col)
-                logger.warning(
-                    "Column %r missing on table %s; adding it to the schema will store this data. Retrying without it. Run: ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s text;",
-                    col,
-                    table,
-                    table,
-                    col,
-                )
-                continue
-            logger.warning("Supabase upsert failed: %s", e)
-            return 0
-    return 0
+                skipped_columns.add(match.group(1))
+                logger.warning("Column %r missing on table %s; skipping that column for all rows.", match.group(1), table)
+                rows = build_rows(skip_columns=skipped_columns)
+                total_upserted = 0
+                failed = 0
+                for i, r in enumerate(rows):
+                    try:
+                        if use_upsert:
+                            client.table(table).upsert([r], on_conflict="url").execute()
+                        else:
+                            client.table(table).insert([r]).execute()
+                        total_upserted += 1
+                    except Exception as e3:
+                        logger.warning("Supabase failed for paper %d: %s", i + 1, e3)
+                        failed += 1
+                break
+            logger.warning("Supabase upsert failed for paper %d (url=%s): %s", idx + 1, (row.get("url") or "")[:50], e)
+            failed += 1
+    if failed > 0:
+        logger.warning("Supabase: %d papers upserted, %d failed.", total_upserted, failed)
+    if not use_upsert and total_upserted > 0:
+        logger.warning(
+            "Table %s has no UNIQUE constraint on url; used INSERT (duplicates possible). Add one: ALTER TABLE %s ADD CONSTRAINT papers_url_key UNIQUE (url);",
+            table,
+            table,
+        )
+    if skipped_columns:
+        logger.info(
+            "Upserted %d papers to Supabase table %s (omitted columns not in table: %s).",
+            total_upserted,
+            table,
+            ", ".join(sorted(skipped_columns)),
+        )
+    else:
+        logger.info("Upserted %d papers to Supabase table %s.", total_upserted, table)
+    return total_upserted
 
 
 def main() -> None:
@@ -1306,6 +1843,13 @@ def main() -> None:
         "--paragraph",
         action="store_true",
         help="Treat prompt as a paragraph: Claude summarizes it to a research topic, then the harness runs on that topic",
+    )
+    parser.add_argument(
+        "--sources",
+        type=str,
+        default=os.environ.get("SOURCES", "arxiv,biorxiv,openalex,semantic_scholar,internet"),
+        metavar="LIST",
+        help="Comma-separated sources to use: arxiv, biorxiv, openalex, semantic_scholar, internet (default: all)",
     )
     parser.add_argument(
         "--candidates",
@@ -1347,11 +1891,22 @@ def main() -> None:
         if not topic:
             topic = args.prompt
 
+    sources_set: set[str] = set()
+    for name in (args.sources or "").split(","):
+        name = name.strip().lower().replace("-", "_")
+        if name == "semantic_scholar" or name == "s2":
+            sources_set.add("semantic_scholar")
+        elif name in ALL_SOURCES:
+            sources_set.add(name)
+    if not sources_set:
+        sources_set = set(ALL_SOURCES)
+
     papers = run_harness(
         prompt=topic,
         candidate_count=args.candidates,
         top_k=args.top,
         max_age_months=args.max_age_months,
+        sources=sources_set,
     )
 
     print(json.dumps([paper_to_dict(p, topic=topic) for p in papers], indent=2))

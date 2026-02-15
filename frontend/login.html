@@ -36,32 +36,64 @@
         </p>
       </div>
 
-      <!-- ===== SIGNUP FORM ===== -->
+      <!-- ===== SIGNUP FORM — Step 1: Credentials ===== -->
       <div id="signup-view" style="display:none">
         <h1>Create an account</h1>
         <p class="subtitle">Get started with Papermint</p>
 
-        <form class="auth-form" onsubmit="handleSignup(event)">
-          <div class="form-row">
-            <div class="form-group">
-              <label for="signup-first">First name</label>
-              <input id="signup-first" type="text" placeholder="Jane" required />
+        <!-- Step 1 -->
+        <div id="signup-step1">
+          <form class="auth-form" onsubmit="goToStep2(event)">
+            <div class="form-row">
+              <div class="form-group">
+                <label for="signup-first">First name</label>
+                <input id="signup-first" type="text" placeholder="Jane" required />
+              </div>
+              <div class="form-group">
+                <label for="signup-last">Last name</label>
+                <input id="signup-last" type="text" placeholder="Doe" required />
+              </div>
             </div>
             <div class="form-group">
-              <label for="signup-last">Last name</label>
-              <input id="signup-last" type="text" placeholder="Doe" required />
+              <label for="signup-email">Email</label>
+              <input id="signup-email" type="email" placeholder="you@example.com" required />
             </div>
-          </div>
-          <div class="form-group">
-            <label for="signup-email">Email</label>
-            <input id="signup-email" type="email" placeholder="you@example.com" required />
-          </div>
-          <div class="form-group">
-            <label for="signup-password">Password</label>
-            <input id="signup-password" type="password" placeholder="••••••••" minlength="6" required />
-          </div>
-          <button type="submit" class="btn btn-primary" id="signup-btn">Create account</button>
-        </form>
+            <div class="form-group">
+              <label for="signup-password">Password</label>
+              <input id="signup-password" type="password" placeholder="••••••••" minlength="6" required />
+            </div>
+            <button type="submit" class="btn btn-primary">Next →</button>
+          </form>
+        </div>
+
+        <!-- Step 2: Role + Bio -->
+        <div id="signup-step2" style="display:none">
+          <form class="auth-form" onsubmit="handleSignup(event)">
+            <div class="form-group">
+              <label>What best describes you?</label>
+              <div class="role-options" id="role-options">
+                <button type="button" class="role-chip" data-role="Researcher" onclick="pickRole(this)">🔬 Researcher</button>
+                <button type="button" class="role-chip" data-role="VC / Investor" onclick="pickRole(this)">💰 VC / Investor</button>
+                <button type="button" class="role-chip" data-role="Founder" onclick="pickRole(this)">🚀 Founder</button>
+                <button type="button" class="role-chip" data-role="Engineer" onclick="pickRole(this)">⚙️ Engineer</button>
+                <button type="button" class="role-chip" data-role="Student" onclick="pickRole(this)">🎓 Student</button>
+                <button type="button" class="role-chip" data-role="Other" onclick="pickRole(this)">✦ Other</button>
+              </div>
+              <input id="signup-custom-role" type="text" placeholder="Your role…"
+                style="display:none; margin-top:8px" />
+            </div>
+
+            <div class="form-group">
+              <label for="signup-bio">How will you use Papermint?</label>
+              <textarea id="signup-bio" rows="3"
+                placeholder="e.g. I'm scouting for breakthroughs in biotech to inform our fund's thesis…"
+                style="width:100%; padding:10px 14px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-sm); font-size:0.9rem; font-family:inherit; resize:vertical;"></textarea>
+            </div>
+
+            <button type="submit" class="btn btn-primary" id="signup-btn">Create account</button>
+            <button type="button" class="btn btn-ghost" style="width:100%" onclick="backToStep1()">← Back</button>
+          </form>
+        </div>
 
         <p class="auth-toggle">
           Already have an account? <a href="#login" onclick="showLogin()">Log in</a>
@@ -130,6 +162,38 @@
       window.location.href = 'dashboard.html';
     }
 
+    // ----- Signup step management -----
+    let _selectedRole = '';
+
+    function goToStep2(e) {
+      e.preventDefault();
+      hideError();
+      document.getElementById('signup-step1').style.display = 'none';
+      document.getElementById('signup-step2').style.display = 'block';
+    }
+
+    function backToStep1() {
+      document.getElementById('signup-step2').style.display = 'none';
+      document.getElementById('signup-step1').style.display = 'block';
+    }
+
+    function pickRole(btn) {
+      // Deselect all
+      document.querySelectorAll('.role-chip').forEach(c => c.classList.remove('selected'));
+      btn.classList.add('selected');
+      _selectedRole = btn.dataset.role;
+
+      // Show custom input if "Other"
+      const custom = document.getElementById('signup-custom-role');
+      if (_selectedRole === 'Other') {
+        custom.style.display = 'block';
+        custom.focus();
+      } else {
+        custom.style.display = 'none';
+        custom.value = '';
+      }
+    }
+
     // ----- Signup handler -----
     async function handleSignup(e) {
       e.preventDefault();
@@ -143,7 +207,16 @@
       const email = document.getElementById('signup-email').value;
       const password = document.getElementById('signup-password').value;
 
-      const { data, error } = await authSignUp({ email, password, firstName, lastName });
+      // Role: use custom input if "Other", otherwise the chip value
+      let role = _selectedRole;
+      if (role === 'Other') {
+        const custom = document.getElementById('signup-custom-role').value.trim();
+        role = custom || 'Other';
+      }
+
+      const bio = (document.getElementById('signup-bio').value || '').trim();
+
+      const { data, error } = await authSignUp({ email, password, firstName, lastName, role, bio });
 
       if (error) {
         showError(error.message);
@@ -152,9 +225,14 @@
         return;
       }
 
+      // Also update the profile via the API (in case the trigger doesn't capture role/bio)
+      if (data.user) {
+        try {
+          await updateProfileAPI(data.user.id, { role, bio });
+        } catch { /* best effort */ }
+      }
+
       // Some Supabase projects require email confirmation.
-      // If the session exists right away, go to dashboard.
-      // Otherwise show a "check your email" message.
       if (data.session) {
         window.location.href = 'dashboard.html';
       } else {

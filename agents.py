@@ -18,7 +18,7 @@ from typing import Any
 
 from anthropic import Anthropic
 
-MODEL = "claude-haiku-4-5-20251001"
+MODEL = "claude-sonnet-4-5-20250929"
 MAX_TOKENS = 1024
 
 # ---------------------------------------------------------------------------
@@ -34,10 +34,11 @@ hidden gems.  Your job:
 • Estimate the *potential impact* — academic and commercial.
 • **Evaluate topicality** — how closely does this paper relate to the
   user's search topic?  Is it core, adjacent, or only tangentially related?
-• Flag which investor / VC verticals should care (e.g. biotech, robotics,
-  climate-tech, AI infra, etc.).
+• Suggest the *big ideas* this paper could inspire — new research
+  directions, applications, paradigm shifts, or cross-domain connections.
 • Be specific: cite numbers, comparisons, or prior work when possible.
 
+{user_context}
 Keep your response concise and under 120 words.
 """
 
@@ -46,13 +47,14 @@ You are the **Advocate** — an enthusiastic but rigorous champion of
 promising research.  Your job:
 
 • Build on the Scout's analysis and *strengthen* the case for this paper.
-• Identify real-world applications, potential start-up ideas, or products
-  that could emerge from this work.
-• Draw connections to adjacent fields or market trends.
+• Identify real-world applications, potential products, or new research
+  directions that could emerge from this work.
+• Draw connections to adjacent fields or trends.
 • Comment on how relevant the paper is to the search topic — if it's
   adjacent, explain *why* it still matters.
 • Rebut the Skeptic's concerns point-by-point when they arise.
 
+{user_context}
 Stay grounded in evidence — never resort to empty hype.
 Keep your response concise and under 120 words.
 """
@@ -62,7 +64,7 @@ You are the **Skeptic** — a sharp, fair, but tough critic.  Your job:
 
 • Stress-test the paper's claims: methodology, statistical rigour,
   dataset quality, reproducibility.
-• Identify *risks* — technical barriers, market timing, ethical issues,
+• Identify *risks* — technical barriers, timing, ethical issues,
   regulatory headwinds.
 • Assess **topicality** — if the paper is only loosely related to the
   search topic, flag it.  A technically sound paper that's off-topic is
@@ -71,6 +73,7 @@ You are the **Skeptic** — a sharp, fair, but tough critic.  Your job:
   evidence.
 • Suggest what *additional evidence* would be needed to convince you.
 
+{user_context}
 Be concise and specific.  Aim for constructive criticism, not dismissal.
 Keep your response under 120 words.
 """
@@ -81,19 +84,19 @@ between a Scout, an Advocate and a Skeptic about a research paper.
 
 Produce a **structured JSON** verdict with exactly these keys:
 
-{
+{{
   "verdict": "PROMISING" | "INTERESTING" | "UNCERTAIN" | "WEAK",
   "confidence": <float 0-1>,
   "topicality": <float 0-1, how relevant the paper is to the search topic>,
-  "one_liner": "<1-sentence summary for a busy investor>",
+  "one_liner": "<1-sentence summary>",
   "key_strengths": ["...", "..."],
   "key_risks": ["...", "..."],
-  "suggested_verticals": ["...", "..."],
+  "big_ideas": ["<broad ideas / directions this paper could inspire>", "..."],
   "follow_up_questions": ["...", "..."]
-}
+}}
 
 IMPORTANT RULES:
-• **Always** populate one_liner, key_strengths and key_risks — even when
+• **Always** populate one_liner, key_strengths, key_risks, big_ideas — even when
   the verdict is UNCERTAIN or WEAK.  There is always *something* to say.
 • topicality: 1.0 = core to the search topic, 0.5 = adjacent, 0.0 = unrelated.
 • Return ONLY valid JSON — no markdown fences, no commentary outside the JSON.
@@ -190,6 +193,7 @@ def run_debate(
     client: Anthropic | None = None,
     model: str = MODEL,
     verbose: bool = False,
+    user_context: str = "",
 ) -> DebateResult:
     """
     Run a multi-round Scout → Advocate → Skeptic debate on *paper*,
@@ -208,6 +212,8 @@ def run_debate(
         Claude model to use.
     verbose : bool
         Print agent responses to stdout as they happen.
+    user_context : str
+        Optional context about the user (role, bio) to inform the agents.
 
     Returns
     -------
@@ -216,9 +222,14 @@ def run_debate(
     if client is None:
         client = Anthropic()
 
-    scout = Agent(name="Scout", system_prompt=SCOUT_SYSTEM, client=client, model=model)
-    advocate = Agent(name="Advocate", system_prompt=ADVOCATE_SYSTEM, client=client, model=model)
-    skeptic = Agent(name="Skeptic", system_prompt=SKEPTIC_SYSTEM, client=client, model=model)
+    # Build user context blurb for system prompts
+    _uc = ""
+    if user_context:
+        _uc = f"USER CONTEXT (tailor your analysis to this user's perspective):\n{user_context}\n"
+
+    scout = Agent(name="Scout", system_prompt=SCOUT_SYSTEM.format(user_context=_uc), client=client, model=model)
+    advocate = Agent(name="Advocate", system_prompt=ADVOCATE_SYSTEM.format(user_context=_uc), client=client, model=model)
+    skeptic = Agent(name="Skeptic", system_prompt=SKEPTIC_SYSTEM.format(user_context=_uc), client=client, model=model)
 
     paper_text = _format_paper(paper)
     rounds: list[dict[str, str]] = []
@@ -311,7 +322,7 @@ def run_debate(
     _KEY_ALIASES = {
         "key_strengths": ["strengths", "key_strength"],
         "key_risks": ["risks", "key_risk", "concerns"],
-        "suggested_verticals": ["verticals", "industries", "sectors"],
+        "big_ideas": ["suggested_verticals", "verticals", "industries", "sectors", "ideas"],
         "follow_up_questions": ["questions", "follow_ups", "followup_questions"],
         "topicality": ["topic_relevance", "relevance", "topicality_score"],
     }
@@ -326,7 +337,7 @@ def run_debate(
     verdict.setdefault("one_liner", "")
     verdict.setdefault("key_strengths", [])
     verdict.setdefault("key_risks", [])
-    verdict.setdefault("suggested_verticals", [])
+    verdict.setdefault("big_ideas", [])
     verdict.setdefault("follow_up_questions", [])
     verdict.setdefault("topicality", 0.5)
 

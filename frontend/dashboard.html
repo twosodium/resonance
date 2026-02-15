@@ -106,8 +106,38 @@
     </div>
   </div>
 
+  <!-- ===== FLOATING CHAT PANEL ===== -->
+  <div id="chat-panel" class="chat-float">
+    <div class="chat-float-header">
+      <div class="chat-float-title">
+        <span class="chat-float-icon">💬</span>
+        <h4 id="chat-title">Chat</h4>
+      </div>
+      <div class="chat-float-actions">
+        <button class="chat-float-btn" onclick="resetChat()" title="New conversation">↻</button>
+        <button class="chat-float-btn" onclick="closeChatPanel()">✕</button>
+      </div>
+    </div>
+    <div class="chat-float-body" id="chat-body">
+      <!-- messages rendered here -->
+    </div>
+    <div class="chat-float-suggestions" id="chat-suggestions">
+      <!-- suggestion chips rendered here -->
+    </div>
+    <div class="chat-float-input">
+      <input id="chat-input-field" type="text" placeholder="Ask about this paper…"
+        onkeydown="if(event.key==='Enter')sendChat()" autocomplete="off" />
+      <button onclick="sendChat()" id="chat-send-btn">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <path d="M8 14V2M8 2L3 7M8 2L13 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+
   <!-- Supabase SDK (CDN) + our shared client -->
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="supabase.js"></script>
   <script src="app.js"></script>
 </body>

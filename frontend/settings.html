@@ -43,6 +43,33 @@
 
       <div class="settings-grid">
 
+        <!-- Profile -->
+        <div class="settings-card" style="grid-column: 1 / -1">
+          <h3>Profile</h3>
+          <p class="settings-desc">Tell us about yourself — this context is shared with the AI agents to tailor their analysis to your perspective.</p>
+
+          <div class="form-group">
+            <label>Role</label>
+            <div class="role-options" id="settings-role-options">
+              <button type="button" class="role-chip" data-role="Researcher" onclick="pickSettingsRole(this)">🔬 Researcher</button>
+              <button type="button" class="role-chip" data-role="VC / Investor" onclick="pickSettingsRole(this)">💰 VC / Investor</button>
+              <button type="button" class="role-chip" data-role="Founder" onclick="pickSettingsRole(this)">🚀 Founder</button>
+              <button type="button" class="role-chip" data-role="Engineer" onclick="pickSettingsRole(this)">⚙️ Engineer</button>
+              <button type="button" class="role-chip" data-role="Student" onclick="pickSettingsRole(this)">🎓 Student</button>
+              <button type="button" class="role-chip" data-role="Other" onclick="pickSettingsRole(this)">✦ Other</button>
+            </div>
+            <input id="settings-custom-role" type="text" placeholder="Your role…"
+              style="display:none; margin-top:8px" />
+          </div>
+
+          <div class="form-group">
+            <label for="settings-bio">How do you use Papermint?</label>
+            <textarea id="settings-bio" rows="3"
+              placeholder="e.g. I'm scouting for breakthroughs in biotech to inform our fund's thesis…"
+              style="width:100%; padding:10px 14px; background:var(--bg-input); border:1px solid var(--border); border-radius:var(--radius-sm); font-size:0.9rem; font-family:inherit; resize:vertical;"></textarea>
+          </div>
+        </div>
+
         <!-- API Keys -->
         <div class="settings-card">
           <h3>API Keys</h3>
@@ -99,12 +126,25 @@
             </div>
           </div>
 
+        </div>
+
+        <!-- Poke Integration -->
+        <div class="settings-card">
+          <h3>Poke Integration</h3>
+          <p class="settings-desc">Link your Papermint account to the Poke group-chat bot. Generate a token, then paste it into the chat.</p>
+
           <div class="form-group">
-            <label for="multiplier">Multiplier (keep top 1/N)</label>
-            <div class="range-row">
-              <input id="multiplier" type="range" min="1" max="10" value="3" />
-              <span id="multiplier-val" class="range-val">3</span>
+            <label>Link Token</label>
+            <div class="key-input-row">
+              <input id="link-token-display" type="text" readonly
+                placeholder="Click generate to create a token"
+                style="font-family: monospace; letter-spacing: 0.5px;" />
+              <button class="btn btn-ghost" id="copy-token-btn" onclick="copyLinkToken()" style="display:none" title="Copy to clipboard">📋</button>
             </div>
+            <button class="btn btn-outline" onclick="generateLinkToken()" id="gen-token-btn" style="margin-top: 8px;">
+              Generate link token
+            </button>
+            <p id="token-expiry" style="margin-top: 6px; font-size: 0.8rem; color: var(--text-secondary); display: none;"></p>
           </div>
         </div>
 
@@ -146,24 +186,73 @@
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="supabase.js"></script>
   <script>
+    let _settingsUserId = null;
+    let _settingsRole = '';
+
     // --- Init ---
     (async () => {
       const user = await requireAuth();
       if (!user) return;
+      _settingsUserId = user.id;
 
       const { data: profile } = await getProfile(user.id);
       const name = profile?.first_name || user.email?.split('@')[0] || '?';
       document.getElementById('avatar').textContent = name.charAt(0).toUpperCase();
 
       await loadSettings();
+      await loadProfile();
     })();
 
     // Bind range inputs to display values
-    ['candidate-count', 'top-k', 'debate-rounds', 'multiplier'].forEach(id => {
+    ['candidate-count', 'top-k', 'debate-rounds'].forEach(id => {
       const input = document.getElementById(id);
       const display = document.getElementById(id + '-val');
       input.addEventListener('input', () => { display.textContent = input.value; });
     });
+
+    // --- Profile role picker ---
+    function pickSettingsRole(btn) {
+      document.querySelectorAll('#settings-role-options .role-chip').forEach(c => c.classList.remove('selected'));
+      btn.classList.add('selected');
+      _settingsRole = btn.dataset.role;
+
+      const custom = document.getElementById('settings-custom-role');
+      if (_settingsRole === 'Other') {
+        custom.style.display = 'block';
+        custom.focus();
+      } else {
+        custom.style.display = 'none';
+        custom.value = '';
+      }
+    }
+
+    async function loadProfile() {
+      if (!_settingsUserId) return;
+      try {
+        const p = await fetchProfileAPI(_settingsUserId);
+        const role = p.role || '';
+        const bio = p.bio || '';
+        document.getElementById('settings-bio').value = bio;
+
+        // Select the matching role chip
+        const chips = document.querySelectorAll('#settings-role-options .role-chip');
+        const builtInRoles = ['Researcher', 'VC / Investor', 'Founder', 'Engineer', 'Student', 'Other'];
+        const matchChip = Array.from(chips).find(c => c.dataset.role === role);
+
+        if (matchChip) {
+          pickSettingsRole(matchChip);
+        } else if (role) {
+          // Custom role: select "Other" and fill in the custom field
+          const otherChip = Array.from(chips).find(c => c.dataset.role === 'Other');
+          if (otherChip) {
+            pickSettingsRole(otherChip);
+            document.getElementById('settings-custom-role').value = role;
+          }
+        }
+      } catch (err) {
+        console.warn('Could not load profile:', err);
+      }
+    }
 
     async function loadSettings() {
       try {
@@ -174,8 +263,6 @@
         setRange('candidate-count', s.candidate_count || 5);
         setRange('top-k', s.top_k || 5);
         setRange('debate-rounds', s.debate_rounds || 2);
-        setRange('multiplier', s.multiplier || 3);
-
         document.getElementById('browserbase-toggle').checked = !s.skip_browserbase;
 
         document.getElementById('anthropic-status').textContent = s.has_anthropic_key ? '✓ set' : '✗ not set';
@@ -202,7 +289,6 @@
         candidate_count: parseInt(document.getElementById('candidate-count').value),
         top_k: parseInt(document.getElementById('top-k').value),
         debate_rounds: parseInt(document.getElementById('debate-rounds').value),
-        multiplier: parseInt(document.getElementById('multiplier').value),
         skip_browserbase: !document.getElementById('browserbase-toggle').checked,
       };
 
@@ -217,12 +303,25 @@
       if (bbProj) body.browserbase_project_id = bbProj;
 
       try {
+        // Save pipeline settings
         const resp = await fetch(`${API_BASE}/api/settings`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
         if (!resp.ok) throw new Error('Save failed');
+
+        // Save profile (role + bio)
+        if (_settingsUserId) {
+          let role = _settingsRole;
+          if (role === 'Other') {
+            const custom = document.getElementById('settings-custom-role').value.trim();
+            role = custom || 'Other';
+          }
+          const bio = document.getElementById('settings-bio').value.trim();
+          await updateProfileAPI(_settingsUserId, { role, bio });
+        }
+
         showStatus('✓ Settings saved', false);
         await loadSettings(); // refresh status badges
       } catch (err) {
@@ -231,6 +330,55 @@
 
       btn.textContent = 'Save settings';
       btn.disabled = false;
+    }
+
+    // --- Poke link token ---
+    async function generateLinkToken() {
+      if (!_settingsUserId) {
+        showStatus('⚠ Not logged in.', true);
+        return;
+      }
+
+      const btn = document.getElementById('gen-token-btn');
+      btn.textContent = 'Generating…';
+      btn.disabled = true;
+
+      try {
+        const resp = await fetch(`${API_BASE}/api/link-token`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user_id: _settingsUserId }),
+        });
+        if (!resp.ok) throw new Error('Failed to generate token');
+        const data = await resp.json();
+
+        const display = document.getElementById('link-token-display');
+        display.value = data.token;
+        document.getElementById('copy-token-btn').style.display = 'inline-flex';
+
+        const exp = new Date(data.expires);
+        document.getElementById('token-expiry').style.display = 'block';
+        document.getElementById('token-expiry').textContent =
+          `⏱ Expires at ${exp.toLocaleTimeString()} (single-use)`;
+
+        showStatus('✓ Token generated — paste it in your Poke group chat.', false);
+      } catch (err) {
+        showStatus('⚠ ' + err.message, true);
+      }
+
+      btn.textContent = 'Generate link token';
+      btn.disabled = false;
+    }
+
+    function copyLinkToken() {
+      const display = document.getElementById('link-token-display');
+      navigator.clipboard.writeText(display.value).then(() => {
+        showStatus('✓ Token copied to clipboard', false);
+      }).catch(() => {
+        display.select();
+        document.execCommand('copy');
+        showStatus('✓ Token copied', false);
+      });
     }
 
     function showStatus(msg, isError) {

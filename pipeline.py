@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
+import concurrent.futures
 import os
 import re
 from datetime import datetime, timezone
@@ -49,7 +49,7 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 
 def load_config() -> dict:
     """Read config.json, falling back to sensible defaults."""
-    defaults = {"topic": "mechanistic interpretability", "multiplier": 3}
+    defaults = {"topic": "mechanistic interpretability"}
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
@@ -243,7 +243,7 @@ def store_debate(
         "one_liner": v.get("one_liner", ""),
         "key_strengths": json.dumps(v.get("key_strengths", [])),
         "key_risks": json.dumps(v.get("key_risks", [])),
-        "suggested_verticals": json.dumps(v.get("suggested_verticals", [])),
+        "big_ideas": json.dumps(v.get("big_ideas", [])),
         "follow_up_questions": json.dumps(v.get("follow_up_questions", [])),
         "debate_log": json.dumps(result.rounds),
         "raw_verdict": result.raw_verdict,
@@ -260,19 +260,18 @@ def run_debate_pipeline(
     topic: str | None = None,
     *,
     user_id: str | None = None,
-    multiplier: int | None = None,
+    user_context: str = "",
     debate_rounds: int = 2,
     limit: int = 50,
     verbose: bool = False,
     on_phase: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Pull papers for *topic* from the DB, debate each one, store verdicts,
-    then return the top 1/multiplier papers ranked by confidence.
+    Pull papers for *topic* from the DB, debate each one **in parallel**,
+    store verdicts, and return all results sorted by confidence.
     """
     cfg = load_config()
     topic = topic or cfg["topic"]
-    multiplier = multiplier or cfg.get("multiplier", 3)
     sb = _get_supabase()
 
     # 1. Fetch papers --------------------------------------------------------
@@ -287,22 +286,26 @@ def run_debate_pipeline(
     if on_phase:
         on_phase("debating")
 
-    # 2. Debate each paper ---------------------------------------------------
-    all_results: list[dict[str, Any]] = []
-    for idx, paper in enumerate(papers, 1):
+    # 2. Debate papers in parallel -------------------------------------------
+    from anthropic import Anthropic as _Anthropic
+
+    shared_client = _Anthropic()
+
+    def _debate_one(idx_paper: tuple[int, dict]) -> dict[str, Any]:
+        idx, paper = idx_paper
         name = paper.get("paper_name", "?")
         logger.info("[%d/%d] Debating: %s", idx, len(papers), name)
 
-        debate_result = run_debate(paper, num_rounds=debate_rounds, verbose=verbose)
+        debate_result = run_debate(
+            paper,
+            num_rounds=debate_rounds,
+            client=shared_client,
+            verbose=verbose,
+            user_context=user_context,
+        )
 
-        # 3. Store verdict ---------------------------------------------------
+        # Store verdict
         stored = store_debate(sb, debate_result, user_id=user_id)
-        all_results.append({
-            "paper": paper,
-            "verdict": debate_result.verdict,
-            "debate_log": debate_result.rounds,
-            "stored": stored,
-        })
 
         v = debate_result.verdict
         emoji = {
@@ -311,13 +314,20 @@ def run_debate_pipeline(
         }.get(v.get("verdict", ""), "⚪")
         logger.info("  %s %s  (confidence %.2f)", emoji, v.get("verdict", "?"), v.get("confidence", 0))
 
-    # 4. Apply multiplier — keep top 1/multiplier by confidence ---------------
-    all_results.sort(key=lambda r: r["verdict"].get("confidence", 0.0), reverse=True)
-    top_n = max(1, math.ceil(len(all_results) / multiplier))
-    top_results = all_results[:top_n]
+        return {
+            "paper": paper,
+            "verdict": debate_result.verdict,
+            "debate_log": debate_result.rounds,
+            "stored": stored,
+        }
 
-    logger.info("Returning top %d / %d papers (multiplier=1/%d)", top_n, len(all_results), multiplier)
-    return top_results
+    max_workers = min(5, len(papers))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        all_results = list(pool.map(_debate_one, enumerate(papers, 1)))
+
+    all_results.sort(key=lambda r: r["verdict"].get("confidence", 0.0), reverse=True)
+    logger.info("Returning all %d debated papers", len(all_results))
+    return all_results
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +338,7 @@ def full_pipeline(
     topic: str,
     *,
     user_id: str | None = None,
+    user_context: str = "",
     candidate_count: int | None = None,
     top_k: int | None = None,
     debate_rounds: int | None = None,
@@ -364,6 +375,7 @@ def full_pipeline(
     debate_results = run_debate_pipeline(
         topic=topic,
         user_id=user_id,
+        user_context=user_context,
         debate_rounds=debate_rounds,
         verbose=verbose,
         on_phase=on_phase,
@@ -387,12 +399,10 @@ def get_top_papers(
     topic: str | None = None,
     *,
     user_id: str | None = None,
-    multiplier: int | None = None,
 ) -> list[dict]:
-    """Fetch the top 1/*multiplier* debates, joined with paper data."""
+    """Fetch all debates for *topic*, joined with paper data, sorted by confidence."""
     cfg = load_config()
     topic = topic or cfg["topic"]
-    multiplier = multiplier or cfg.get("multiplier", 3)
     sb = _get_supabase()
 
     query = (
@@ -406,10 +416,7 @@ def get_top_papers(
         query = query.eq("user_id", user_id)
 
     resp = query.execute()
-    rows = resp.data if resp.data else []
-
-    top_n = max(1, math.ceil(len(rows) / multiplier)) if rows else 0
-    return rows[:top_n]
+    return resp.data if resp.data else []
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +431,6 @@ if __name__ == "__main__":
     parser.add_argument("--full", action="store_true", help="Run full pipeline (scrape + debate).")
     parser.add_argument("--topic", type=str, default=None, help=f"Topic (default: {cfg['topic']}).")
     parser.add_argument("--user-id", type=str, default=None, help="User UUID to tag rows with.")
-    parser.add_argument("--multiplier", type=int, default=None, help=f"Top 1/N (default: {cfg.get('multiplier', 3)}).")
     parser.add_argument("--rounds", type=int, default=2, help="Debate rounds per paper.")
     parser.add_argument("--limit", type=int, default=20, help="Max papers to pull from DB.")
     parser.add_argument("--candidates", type=int, default=50, help="Candidates per scraper source.")
@@ -459,7 +465,6 @@ if __name__ == "__main__":
         results = run_debate_pipeline(
             topic=topic,
             user_id=args.user_id,
-            multiplier=args.multiplier,
             debate_rounds=args.rounds,
             limit=args.limit,
             verbose=args.verbose,

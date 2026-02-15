@@ -11,18 +11,21 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import threading
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 # Load .env from project root
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+load_dotenv(_ENV_PATH)
 
 from pipeline import full_pipeline, load_config, save_config  # noqa: E402 (must be after dotenv)
+from supabase import create_client as _create_client  # noqa: E402
 
 logger = logging.getLogger("api")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
@@ -43,6 +46,35 @@ _paper_chats_lock = threading.Lock()
 
 app = Flask(__name__)
 CORS(app)  # allow frontend on any origin during dev
+
+
+def _get_sb():
+    """Return a Supabase client for profile lookups."""
+    return _create_client(
+        os.environ.get("SUPABASE_URL", ""),
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY", ""),
+    )
+
+
+def _build_user_context(user_id: str | None) -> str:
+    """Fetch user profile and return a short context string for the agents."""
+    if not user_id:
+        return ""
+    try:
+        sb = _get_sb()
+        resp = sb.table("profiles").select("role, bio").eq("id", user_id).single().execute()
+        profile = resp.data if resp.data else {}
+    except Exception:
+        return ""
+
+    parts = []
+    role = (profile.get("role") or "").strip()
+    bio = (profile.get("bio") or "").strip()
+    if role:
+        parts.append(f"Role: {role}")
+    if bio:
+        parts.append(f"Bio: {bio}")
+    return "\n".join(parts)
 
 # ---------------------------------------------------------------------------
 # In-memory job tracker  (topic -> status dict)
@@ -85,12 +117,16 @@ def search():
 
     _set_job(job_key, "scraping")
 
+    # Build user context once before spawning the thread
+    user_ctx = _build_user_context(user_id)
+
     def _run():
         try:
             _set_job(job_key, "scraping")
             result = full_pipeline(
                 topic=topic,
                 user_id=user_id,
+                user_context=user_ctx,
                 on_phase=lambda phase: _set_job(job_key, phase),
             )
             _set_job(
@@ -134,7 +170,6 @@ def get_settings():
     cfg = load_config()
     return jsonify({
         "topic": cfg.get("topic", ""),
-        "multiplier": cfg.get("multiplier", 3),
         "candidate_count": cfg.get("candidate_count", 5),
         "top_k": cfg.get("top_k", 5),
         "debate_rounds": cfg.get("debate_rounds", 2),
@@ -146,30 +181,178 @@ def get_settings():
 
 @app.route("/api/settings", methods=["PUT"])
 def put_settings():
-    """Update pipeline config and env toggles."""
+    """Update pipeline config and env toggles.
+
+    Pipeline params are saved to ``config.json``.
+    API keys and toggles are written to both ``os.environ`` (immediate
+    effect) **and** the ``.env`` file (survives server restarts).
+    """
     data = request.get_json(silent=True) or {}
 
     cfg = load_config()
 
     # Config file fields
-    for key in ("topic", "multiplier", "candidate_count", "top_k", "debate_rounds"):
+    for key in ("topic", "candidate_count", "top_k", "debate_rounds"):
         if key in data:
             cfg[key] = data[key]
     save_config(cfg)
 
-    # Env-level toggles (persist for the running process)
+    # Env-level toggles — persist to both os.environ AND .env file
     if "skip_browserbase" in data:
-        os.environ["SKIP_BROWSERBASE"] = "1" if data["skip_browserbase"] else ""
+        val = "1" if data["skip_browserbase"] else ""
+        os.environ["SKIP_BROWSERBASE"] = val
+        set_key(_ENV_PATH, "SKIP_BROWSERBASE", val)
 
-    # API keys (only set if provided & non-empty — never echo them back)
+    # API keys — write to env + .env file (only if non-empty)
     if data.get("anthropic_api_key"):
         os.environ["ANTHROPIC_API_KEY"] = data["anthropic_api_key"]
+        set_key(_ENV_PATH, "ANTHROPIC_API_KEY", data["anthropic_api_key"])
     if data.get("browserbase_api_key"):
         os.environ["BROWSERBASE_API_KEY"] = data["browserbase_api_key"]
+        set_key(_ENV_PATH, "BROWSERBASE_API_KEY", data["browserbase_api_key"])
     if data.get("browserbase_project_id"):
         os.environ["BROWSERBASE_PROJECT_ID"] = data["browserbase_project_id"]
+        set_key(_ENV_PATH, "BROWSERBASE_PROJECT_ID", data["browserbase_project_id"])
 
     return jsonify({"ok": True, **cfg})
+
+
+# ---------------------------------------------------------------------------
+# GET/PUT /api/profile — read / update user role & bio
+# ---------------------------------------------------------------------------
+
+@app.route("/api/profile", methods=["GET"])
+def get_profile_api():
+    """Return the current user's role and bio from the profiles table."""
+    user_id = request.args.get("user_id", "").strip()
+    if not user_id:
+        return jsonify({"error": "user_id query param is required"}), 400
+
+    try:
+        sb = _get_sb()
+        resp = sb.table("profiles").select("role, bio, first_name, last_name").eq("id", user_id).single().execute()
+        profile = resp.data if resp.data else {}
+        return jsonify({
+            "role": profile.get("role", ""),
+            "bio": profile.get("bio", ""),
+            "first_name": profile.get("first_name", ""),
+            "last_name": profile.get("last_name", ""),
+        })
+    except Exception as exc:
+        logger.error("get_profile failed: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/profile", methods=["PUT"])
+def put_profile_api():
+    """Update the current user's role and bio."""
+    data = request.get_json(silent=True) or {}
+    user_id = (data.get("user_id") or "").strip()
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+
+    update: dict = {}
+    if "role" in data:
+        update["role"] = (data["role"] or "").strip()
+    if "bio" in data:
+        update["bio"] = (data["bio"] or "").strip()
+    if "first_name" in data:
+        update["first_name"] = (data["first_name"] or "").strip()
+    if "last_name" in data:
+        update["last_name"] = (data["last_name"] or "").strip()
+
+    if not update:
+        return jsonify({"ok": True})
+
+    try:
+        sb = _get_sb()
+        sb.table("profiles").update(update).eq("id", user_id).execute()
+        return jsonify({"ok": True, **update})
+    except Exception as exc:
+        logger.error("put_profile failed: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
+# ---------------------------------------------------------------------------
+# POST /api/link-token — generate a one-time token for Poke account linking
+# GET  /api/link-token/verify — verify a token and return the user_id
+# ---------------------------------------------------------------------------
+
+@app.route("/api/link-token", methods=["POST"])
+def create_link_token():
+    """Generate a short-lived, single-use token that maps to a user_id.
+
+    The user copies this token from the Settings page and pastes it into
+    a Poke group chat.  The MCP server calls ``/api/link-token/verify``
+    to exchange the token for the ``user_id``, then discards the token.
+    """
+    data = request.get_json(silent=True) or {}
+    user_id = (data.get("user_id") or "").strip()
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+
+    token = "pmint_" + secrets.token_urlsafe(16)          # e.g. pmint_a8f3c2...
+    expires = datetime.now(timezone.utc) + timedelta(minutes=15)
+
+    try:
+        sb = _get_sb()
+        sb.table("profiles").update({
+            "link_token": token,
+            "link_token_expires": expires.isoformat(),
+        }).eq("id", user_id).execute()
+    except Exception as exc:
+        logger.error("create_link_token failed: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+    return jsonify({"token": token, "expires": expires.isoformat()})
+
+
+@app.route("/api/link-token/verify", methods=["POST"])
+def verify_link_token():
+    """Exchange a link token for the user_id.  Consumed on first use."""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    if not token:
+        return jsonify({"error": "token is required"}), 400
+
+    try:
+        sb = _get_sb()
+        resp = (
+            sb.table("profiles")
+            .select("id, first_name, role, bio, link_token_expires")
+            .eq("link_token", token)
+            .single()
+            .execute()
+        )
+        profile = resp.data
+    except Exception:
+        return jsonify({"error": "Invalid or expired token."}), 401
+
+    if not profile:
+        return jsonify({"error": "Invalid or expired token."}), 401
+
+    # Check expiry
+    exp_str = profile.get("link_token_expires", "")
+    if exp_str:
+        exp = datetime.fromisoformat(exp_str)
+        if datetime.now(timezone.utc) > exp:
+            return jsonify({"error": "Token has expired. Generate a new one from Settings."}), 401
+
+    # Consume the token — set it to NULL so it can't be reused
+    try:
+        sb.table("profiles").update({
+            "link_token": None,
+            "link_token_expires": None,
+        }).eq("id", profile["id"]).execute()
+    except Exception:
+        pass  # best-effort cleanup
+
+    return jsonify({
+        "user_id": profile["id"],
+        "first_name": profile.get("first_name", ""),
+        "role": profile.get("role", ""),
+        "bio": profile.get("bio", ""),
+    })
 
 
 # ---------------------------------------------------------------------------

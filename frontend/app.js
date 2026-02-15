@@ -14,6 +14,12 @@ let activeDebates = [];   // debates for the active topic
 let activePanel = null;   // currently open debate object
 let _pollTimer = null;    // polling interval id
 
+// Chat state
+let _chatPaperId = null;
+let _chatPaperData = null;
+let _chatHistory = [];    // [{role, content}]
+let _chatSuggestions = [];
+
 
 // ---------------------------------------------------------------------------
 // Init — check auth, then set up the page
@@ -364,7 +370,7 @@ function renderDebates(debates) {
     return;
   }
 
-  debates.forEach(debate => {
+  debates.forEach((debate, idx) => {
     const paper = debate.papers || {};
     const tr = document.createElement('tr');
     tr.onclick = () => openPanel(debate);
@@ -388,7 +394,27 @@ function renderDebates(debates) {
           <span class="confidence-bar-fill" style="width:${confPct}%"></span>
         </span>
       </td>
-      <td>${paperId ? `<button class="delete-btn" title="Delete paper" onclick="event.stopPropagation(); handleDeletePaper(${paperId}, '${escapeAttr(activeTopic)}')">✕</button>` : ''}</td>`;
+      <td class="row-actions">
+        ${paperId ? `<button class="chat-icon-btn" title="Chat about this paper" data-idx="${idx}">💬</button>` : ''}
+        ${paperId ? `<button class="delete-btn" title="Delete paper" data-paper-id="${paperId}">✕</button>` : ''}
+      </td>`;
+
+    // Attach handlers via JS to avoid inline escaping issues
+    const chatBtn = tr.querySelector('.chat-icon-btn');
+    if (chatBtn) {
+      chatBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        const suggestions = parseJsonField(debate.follow_up_questions);
+        openChatPanel(paperId, paperName, paper, suggestions);
+      });
+    }
+    const delBtn = tr.querySelector('.delete-btn');
+    if (delBtn) {
+      delBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        handleDeletePaper(paperId, activeTopic);
+      });
+    }
 
     tbody.appendChild(tr);
   });
@@ -411,6 +437,7 @@ function renderPapersOnly(papers) {
   papers.forEach(paper => {
     const tr = document.createElement('tr');
     tr.onclick = () => openPaperOnlyPanel(paper);
+    const paperId = paper.id;
 
     tr.innerHTML = `
       <td class="paper-title-cell">${paper.paper_name || 'Unknown'}</td>
@@ -418,7 +445,25 @@ function renderPapersOnly(papers) {
       <td class="paper-date-cell">${formatDate(paper.published)}</td>
       <td><span class="verdict-badge uncertain">Pending</span></td>
       <td>—</td>
-      <td>${paper.id ? `<button class="delete-btn" title="Delete paper" onclick="event.stopPropagation(); handleDeletePaper(${paper.id}, '${escapeAttr(activeTopic)}')">✕</button>` : ''}</td>`;
+      <td class="row-actions">
+        ${paperId ? `<button class="chat-icon-btn" title="Chat about this paper">💬</button>` : ''}
+        ${paperId ? `<button class="delete-btn" title="Delete paper">✕</button>` : ''}
+      </td>`;
+
+    const chatBtn = tr.querySelector('.chat-icon-btn');
+    if (chatBtn) {
+      chatBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        openChatPanel(paperId, paper.paper_name || 'Unknown', paper, []);
+      });
+    }
+    const delBtn = tr.querySelector('.delete-btn');
+    if (delBtn) {
+      delBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        handleDeletePaper(paperId, activeTopic);
+      });
+    }
 
     tbody.appendChild(tr);
   });
@@ -442,7 +487,7 @@ function openPanel(debate) {
 
   const keyStrengths = parseJsonField(debate.key_strengths);
   const keyRisks = parseJsonField(debate.key_risks);
-  const suggestedVerticals = parseJsonField(debate.suggested_verticals);
+  const bigIdeas = parseJsonField(debate.big_ideas);
   const followUpQuestions = parseJsonField(debate.follow_up_questions);
 
   body.innerHTML = `
@@ -501,11 +546,11 @@ function openPanel(debate) {
       </ul>
     </div>` : ''}
 
-    ${suggestedVerticals.length ? `
+    ${bigIdeas.length ? `
     <div class="panel-section">
-      <h4>Suggested verticals</h4>
+      <h4>Big ideas</h4>
       <div class="panel-tags">
-        ${suggestedVerticals.map(v => `<span class="panel-tag">${v}</span>`).join('')}
+        ${bigIdeas.map(v => `<span class="panel-tag">${v}</span>`).join('')}
       </div>
     </div>` : ''}
 
@@ -521,17 +566,6 @@ function openPanel(debate) {
     <a class="panel-link" href="${paper.url}" target="_blank" rel="noopener">
       View paper ↗
     </a>` : ''}
-
-    ${(paper.id || debate.paper_id) ? `
-    <div class="chat-panel" id="paper-chat-panel">
-      <h4 style="font-size:0.8rem;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;color:var(--text-tertiary);">Chat about this paper</h4>
-      <div class="chat-messages" id="chat-messages"></div>
-      <div class="chat-input-row">
-        <input id="chat-input" type="text" placeholder="Ask a follow-up question…" autocomplete="off"
-          onkeydown="if(event.key==='Enter')sendChatMessage()" />
-        <button id="chat-send-btn" onclick="sendChatMessage()">Send</button>
-      </div>
-    </div>` : ''}
   `;
 
   panel.classList.add('open');
@@ -582,17 +616,6 @@ function openPaperOnlyPanel(paper) {
     <div class="panel-section" style="margin-top: 32px; text-align: center; color: var(--text-tertiary);">
       <p>Run the debate pipeline to get AI analysis of this paper.</p>
     </div>
-
-    ${paper.id ? `
-    <div class="chat-panel" id="paper-chat-panel">
-      <h4 style="font-size:0.8rem;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;color:var(--text-tertiary);">Chat about this paper</h4>
-      <div class="chat-messages" id="chat-messages"></div>
-      <div class="chat-input-row">
-        <input id="chat-input" type="text" placeholder="Ask a follow-up question…" autocomplete="off"
-          onkeydown="if(event.key==='Enter')sendChatMessage()" />
-        <button id="chat-send-btn" onclick="sendChatMessage()">Send</button>
-      </div>
-    </div>` : ''}
   `;
 
   panel.classList.add('open');
@@ -607,7 +630,14 @@ function closePanel() {
 }
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closePanel();
+  if (e.key === 'Escape') {
+    const chatOpen = document.getElementById('chat-panel')?.classList.contains('open');
+    if (chatOpen) {
+      closeChatPanel();
+    } else {
+      closePanel();
+    }
+  }
 });
 
 
@@ -660,45 +690,139 @@ function timeAgo(isoString) {
 
 
 // ---------------------------------------------------------------------------
-// Paper Chat
+// Floating Chat Panel
 // ---------------------------------------------------------------------------
 
-async function sendChatMessage() {
-  const input = document.getElementById('chat-input');
-  const btn = document.getElementById('chat-send-btn');
-  const msg = (input?.value || '').trim();
-  if (!msg) return;
+function openChatPanel(paperId, paperName, paperData, suggestions) {
+  _chatPaperId = paperId;
+  _chatPaperData = paperData;
+  _chatHistory = [];
+  _chatSuggestions = suggestions || [];
+
+  // Update header
+  document.getElementById('chat-title').textContent = paperName || 'Chat';
+
+  // Clear body
+  const body = document.getElementById('chat-body');
+  body.innerHTML = `
+    <div class="chat-bubble assistant">
+      <div class="chat-bubble-avatar">AI</div>
+      <div class="chat-bubble-content">
+        Hi! I can help you explore <strong>${paperName || 'this paper'}</strong>.
+        Ask me anything — follow-up questions, experiment ideas, or how this connects to other research.
+      </div>
+    </div>`;
+
+  // Render suggestion chips
+  renderSuggestions();
+
+  // Show panel
+  document.getElementById('chat-panel').classList.add('open');
+  document.getElementById('chat-input-field').focus();
+}
+
+function closeChatPanel() {
+  document.getElementById('chat-panel').classList.remove('open');
+}
+
+function resetChat() {
+  if (!_chatPaperId) return;
+  clearPaperChat(_chatPaperId).catch(() => {});
+  openChatPanel(_chatPaperId, document.getElementById('chat-title').textContent, _chatPaperData, _chatSuggestions);
+}
+
+function renderSuggestions() {
+  const container = document.getElementById('chat-suggestions');
+  container.innerHTML = '';
+
+  const questions = (_chatSuggestions || []).slice(0, 3);
+  questions.forEach(q => {
+    const btn = document.createElement('button');
+    btn.className = 'chat-suggestion';
+    btn.textContent = q;
+    btn.title = q;
+    btn.addEventListener('click', () => {
+      document.getElementById('chat-input-field').value = q;
+      sendChat();
+    });
+    container.appendChild(btn);
+  });
+}
+
+async function sendChat() {
+  const input = document.getElementById('chat-input-field');
+  const sendBtn = document.getElementById('chat-send-btn');
+  const msg = (input.value || '').trim();
+  if (!msg || !_chatPaperId) return;
 
   input.value = '';
-  btn.disabled = true;
+  sendBtn.disabled = true;
 
-  // Get the paper from the active panel
-  const debate = activePanel;
-  const paper = debate?.papers || debate || {};
-  const paperId = paper.id || debate?.paper_id;
-  if (!paperId) { btn.disabled = false; return; }
+  // Hide suggestions after first message
+  document.getElementById('chat-suggestions').innerHTML = '';
 
-  // Show user message
-  appendChatMsg('user', msg);
+  // Render user message
+  appendBubble('user', msg);
+
+  // Show typing indicator
+  const typingEl = appendTypingIndicator();
 
   try {
-    const { reply } = await chatWithPaper(paperId, msg, paper);
-    appendChatMsg('assistant', reply);
+    const { reply } = await chatWithPaper(_chatPaperId, msg, _chatPaperData);
+    typingEl.remove();
+    appendBubble('assistant', reply, true);
   } catch (err) {
-    appendChatMsg('assistant', '⚠ ' + (err.message || 'Error sending message'));
+    typingEl.remove();
+    appendBubble('assistant', '⚠ ' + (err.message || 'Something went wrong'), false);
   }
-  btn.disabled = false;
+
+  sendBtn.disabled = false;
   input.focus();
 }
 
-function appendChatMsg(role, text) {
-  const container = document.getElementById('chat-messages');
-  if (!container) return;
-  const div = document.createElement('div');
-  div.className = `chat-msg ${role}`;
-  div.textContent = text;
-  container.appendChild(div);
-  container.scrollTop = container.scrollHeight;
+function appendBubble(role, text, renderMarkdown = false) {
+  const body = document.getElementById('chat-body');
+  const wrapper = document.createElement('div');
+  wrapper.className = `chat-bubble ${role}`;
+
+  const avatar = document.createElement('div');
+  avatar.className = 'chat-bubble-avatar';
+  avatar.textContent = role === 'assistant' ? 'AI' : 'U';
+
+  const content = document.createElement('div');
+  content.className = 'chat-bubble-content';
+
+  if (role === 'assistant' && renderMarkdown && typeof marked !== 'undefined') {
+    content.innerHTML = marked.parse(text);
+  } else {
+    content.textContent = text;
+  }
+
+  wrapper.appendChild(avatar);
+  wrapper.appendChild(content);
+  body.appendChild(wrapper);
+  body.scrollTop = body.scrollHeight;
+}
+
+function appendTypingIndicator() {
+  const body = document.getElementById('chat-body');
+  const wrapper = document.createElement('div');
+  wrapper.className = 'chat-bubble assistant';
+  wrapper.id = 'typing-bubble';
+
+  const avatar = document.createElement('div');
+  avatar.className = 'chat-bubble-avatar';
+  avatar.textContent = 'AI';
+
+  const content = document.createElement('div');
+  content.className = 'chat-bubble-content';
+  content.innerHTML = `<div class="typing-indicator"><span></span><span></span><span></span></div>`;
+
+  wrapper.appendChild(avatar);
+  wrapper.appendChild(content);
+  body.appendChild(wrapper);
+  body.scrollTop = body.scrollHeight;
+  return wrapper;
 }
 
 
