@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Log in — Papermint</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="auth-page">
+    <div class="auth-card fade-in">
+      <a href="index.html" class="auth-back">← Back</a>
+
+      <!-- Error banner (hidden by default) -->
+      <div id="auth-error" style="display:none; background:#fee2e2; color:#dc2626; padding:10px 14px; border-radius:8px; font-size:0.85rem; margin-bottom:16px;"></div>
+
+      <!-- ===== LOGIN FORM ===== -->
+      <div id="login-view">
+        <h1>Welcome back</h1>
+        <p class="subtitle">Log in to your account</p>
+
+        <form class="auth-form" onsubmit="handleLogin(event)">
+          <div class="form-group">
+            <label for="login-email">Email</label>
+            <input id="login-email" type="email" placeholder="you@example.com" required />
+          </div>
+          <div class="form-group">
+            <label for="login-password">Password</label>
+            <input id="login-password" type="password" placeholder="••••••••" required />
+          </div>
+          <button type="submit" class="btn btn-primary" id="login-btn">Log in</button>
+        </form>
+
+        <p class="auth-toggle">
+          Don't have an account? <a href="#signup" onclick="showSignup()">Sign up</a>
+        </p>
+      </div>
+
+      <!-- ===== SIGNUP FORM ===== -->
+      <div id="signup-view" style="display:none">
+        <h1>Create an account</h1>
+        <p class="subtitle">Get started with Papermint</p>
+
+        <form class="auth-form" onsubmit="handleSignup(event)">
+          <div class="form-row">
+            <div class="form-group">
+              <label for="signup-first">First name</label>
+              <input id="signup-first" type="text" placeholder="Jane" required />
+            </div>
+            <div class="form-group">
+              <label for="signup-last">Last name</label>
+              <input id="signup-last" type="text" placeholder="Doe" required />
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="signup-email">Email</label>
+            <input id="signup-email" type="email" placeholder="you@example.com" required />
+          </div>
+          <div class="form-group">
+            <label for="signup-password">Password</label>
+            <input id="signup-password" type="password" placeholder="••••••••" minlength="6" required />
+          </div>
+          <button type="submit" class="btn btn-primary" id="signup-btn">Create account</button>
+        </form>
+
+        <p class="auth-toggle">
+          Already have an account? <a href="#login" onclick="showLogin()">Log in</a>
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Supabase SDK (CDN) + our shared client -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="supabase.js"></script>
+
+  <script>
+    // ----- View toggling -----
+    function showLogin() {
+      document.getElementById('login-view').style.display = 'block';
+      document.getElementById('signup-view').style.display = 'none';
+      hideError();
+    }
+
+    function showSignup() {
+      document.getElementById('login-view').style.display = 'none';
+      document.getElementById('signup-view').style.display = 'block';
+      hideError();
+    }
+
+    // On page load check hash
+    if (window.location.hash === '#signup') showSignup();
+
+    // If already logged in, skip straight to dashboard
+    (async () => {
+      const user = await getUser();
+      if (user) window.location.href = 'dashboard.html';
+    })();
+
+    // ----- Error display -----
+    function showError(msg) {
+      const el = document.getElementById('auth-error');
+      el.textContent = msg;
+      el.style.display = 'block';
+    }
+    function hideError() {
+      document.getElementById('auth-error').style.display = 'none';
+    }
+
+    // ----- Login handler -----
+    async function handleLogin(e) {
+      e.preventDefault();
+      hideError();
+      const btn = document.getElementById('login-btn');
+      btn.textContent = 'Logging in…';
+      btn.disabled = true;
+
+      const email = document.getElementById('login-email').value;
+      const password = document.getElementById('login-password').value;
+
+      const { data, error } = await authSignIn({ email, password });
+
+      if (error) {
+        showError(error.message);
+        btn.textContent = 'Log in';
+        btn.disabled = false;
+        return;
+      }
+
+      window.location.href = 'dashboard.html';
+    }
+
+    // ----- Signup handler -----
+    async function handleSignup(e) {
+      e.preventDefault();
+      hideError();
+      const btn = document.getElementById('signup-btn');
+      btn.textContent = 'Creating account…';
+      btn.disabled = true;
+
+      const firstName = document.getElementById('signup-first').value.trim();
+      const lastName = document.getElementById('signup-last').value.trim();
+      const email = document.getElementById('signup-email').value;
+      const password = document.getElementById('signup-password').value;
+
+      const { data, error } = await authSignUp({ email, password, firstName, lastName });
+
+      if (error) {
+        showError(error.message);
+        btn.textContent = 'Create account';
+        btn.disabled = false;
+        return;
+      }
+
+      // Some Supabase projects require email confirmation.
+      // If the session exists right away, go to dashboard.
+      // Otherwise show a "check your email" message.
+      if (data.session) {
+        window.location.href = 'dashboard.html';
+      } else {
+        showSignupSuccess();
+      }
+    }
+
+    function showSignupSuccess() {
+      document.getElementById('signup-view').innerHTML = `
+        <h1>Check your email</h1>
+        <p class="subtitle" style="margin-bottom:0">
+          We sent a confirmation link to your inbox.<br/>
+          Click it to activate your account, then come back and
+          <a href="#login" onclick="showLogin()" style="text-decoration:underline">log in</a>.
+        </p>
+      `;
+    }
+  </script>
+</body>
+</html>

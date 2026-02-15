@@ -7,7 +7,7 @@ EXPECTED OUTPUT SCHEMA  (each paper is a dict):
         "paper_name":    str,   # title of the paper
         "paper_authors": list,  # e.g. ["Alice", "Bob"]
         "published":     str,   # ISO date, e.g. "2024-11-03"
-        "summary":       str,   # abstract / short description
+        "abstract":      str,   # paper abstract / short description
         "url":           str,   # link to the paper
     }
 

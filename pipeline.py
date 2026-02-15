@@ -90,7 +90,7 @@ async def scrape_and_store(
             "paper_name": p.get("paper_name", p.get("title", "")),
             "paper_authors": p.get("paper_authors", p.get("authors", [])),
             "published": p.get("published", p.get("date", None)),
-            "summary": p.get("summary", p.get("abstract", "")),
+            "abstract": p.get("abstract", p.get("abstract", "")),
             "journal": p.get("journal", ""),
             "fulltext": p.get("fulltext", ""),
             "url": p.get("url", ""),

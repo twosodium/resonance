@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dashboard — Papermint</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="dashboard">
+
+    <!-- ===== TOP BAR ===== -->
+    <header class="dashboard-topbar">
+      <div class="topbar-left">
+        <span class="topbar-logo">◆ papermint</span>
+      </div>
+      <div class="topbar-right">
+        <button class="btn btn-ghost" onclick="handleLogout()">Log out</button>
+        <div class="avatar" id="avatar">J</div>
+      </div>
+    </header>
+
+    <!-- ===== SIDEBAR — previous topics ===== -->
+    <aside class="dashboard-sidebar">
+      <div class="sidebar-item" id="new-search-btn" onclick="showHome()">
+        <span class="icon">+</span> New search
+      </div>
+      <div class="sidebar-label">Previous topics</div>
+      <div id="sidebar-topics">
+        <!-- filled by JS -->
+      </div>
+      <div class="sidebar-spacer"></div>
+      <div class="sidebar-label">Settings</div>
+      <div class="sidebar-item" onclick="alert('Settings coming soon')">
+        <span class="icon">⚙</span> Preferences
+      </div>
+    </aside>
+
+    <!-- ===== MAIN CONTENT ===== -->
+    <main class="dashboard-main" id="main-content">
+
+      <!-- Greeting -->
+      <div class="greeting" id="greeting">
+        <h1>Good morning, Jane</h1>
+        <p>What research direction would you like to explore?</p>
+      </div>
+
+      <!-- Search (home state) -->
+      <div class="search-area" id="search-area">
+        <div class="search-prompt">
+          <input
+            type="text"
+            id="topic-input"
+            placeholder="e.g. mechanistic interpretability, protein folding …"
+            autocomplete="off"
+          />
+          <button class="search-btn" onclick="submitTopic()">→</button>
+        </div>
+        <span class="search-hint">Press Enter to explore a topic</span>
+      </div>
+
+      <!-- Topic results (hidden until a topic is selected) -->
+      <div class="topic-view" id="topic-view">
+        <div class="topic-header">
+          <div>
+            <h2 id="topic-title">Mechanistic Interpretability</h2>
+            <span class="topic-meta" id="topic-meta">6 promising papers · last run 2 hours ago</span>
+          </div>
+          <button class="btn btn-outline" id="rerun-btn">
+            <span>↻</span> Rerun search
+          </button>
+        </div>
+
+        <table class="papers-table">
+          <thead>
+            <tr>
+              <th>Paper</th>
+              <th>Authors</th>
+              <th>Published</th>
+              <th>Verdict</th>
+              <th>Confidence</th>
+            </tr>
+          </thead>
+          <tbody id="papers-tbody">
+            <!-- filled by JS -->
+          </tbody>
+        </table>
+      </div>
+    </main>
+  </div>
+
+  <!-- ===== SIDE PANEL (paper detail) ===== -->
+  <div class="side-panel-overlay" id="panel-overlay"></div>
+  <div class="side-panel" id="side-panel">
+    <div class="panel-header">
+      <h3>Paper details</h3>
+      <button class="panel-close" onclick="closePanel()">✕</button>
+    </div>
+    <div class="panel-body" id="panel-body">
+      <!-- filled by JS -->
+    </div>
+  </div>
+
+  <!-- Supabase SDK (CDN) + our shared client -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="supabase.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
+

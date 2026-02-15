@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from anthropic import Anthropic
 
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-haiku-4-5-20251001"
 MAX_TOKENS = 1024
 
 # ---------------------------------------------------------------------------
@@ -137,14 +138,14 @@ def _format_paper(paper: dict[str, Any]) -> str:
     readable prompt block.
 
     Expected keys (from DB): paper_name, paper_authors (JSON list),
-    published (date string), summary, journal, fulltext, url, topic.
+    published (date string), abstract, journal, fulltext, url, topic.
     Also tolerates the generic keys title/authors/abstract for testing.
     """
     title = paper.get("paper_name") or paper.get("title", "Unknown")
     authors = paper.get("paper_authors") or paper.get("authors", "Unknown")
     if isinstance(authors, list):
         authors = ", ".join(authors)
-    abstract = paper.get("summary") or paper.get("abstract", "")
+    abstract = paper.get("abstract", "")
     date = paper.get("published") or paper.get("date", "")
     url = paper.get("url", "")
     topic = paper.get("topic", "")
@@ -173,7 +174,7 @@ def _format_paper(paper: dict[str, Any]) -> str:
 def run_debate(
     paper: dict[str, Any],
     *,
-    num_rounds: int = 3,
+    num_rounds: int = 2,
     client: Anthropic | None = None,
     model: str = MODEL,
     verbose: bool = False,
@@ -185,7 +186,7 @@ def run_debate(
     Parameters
     ----------
     paper : dict
-        Should contain ``paper_name`` and ``summary`` (Supabase schema),
+        Should contain ``paper_name`` and ``abstract`` (Supabase schema),
         or ``title`` and ``abstract`` for local testing.
     num_rounds : int
         How many debate loops to run (default 3).
@@ -280,11 +281,33 @@ def run_debate(
     if verbose:
         print(f"\n{'='*60}\n⚖️  Moderator verdict:\n{raw_verdict}")
 
-    # Try to parse the verdict as JSON and fall back towrapper if it fails
+    # Try to parse the verdict as JSON -----------------------------------------
+    # Claude sometimes wraps in ```json ... ``` despite being told not to.
+    cleaned = raw_verdict.strip()
+    if cleaned.startswith("```"):
+        # Strip opening ```json and closing ```
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"```\s*$", "", cleaned)
+        cleaned = cleaned.strip()
+
     try:
-        verdict = json.loads(raw_verdict)
+        verdict = json.loads(cleaned)
     except json.JSONDecodeError:
         verdict = {"raw": raw_verdict, "verdict": "UNCERTAIN", "confidence": 0.0}
+
+    # Normalise common key variations Claude might use
+    _KEY_ALIASES = {
+        "key_strengths": ["strengths", "key_strength"],
+        "key_risks": ["risks", "key_risk", "concerns"],
+        "suggested_verticals": ["verticals", "industries", "sectors"],
+        "follow_up_questions": ["questions", "follow_ups", "followup_questions"],
+    }
+    for canonical, aliases in _KEY_ALIASES.items():
+        if canonical not in verdict:
+            for alias in aliases:
+                if alias in verdict:
+                    verdict[canonical] = verdict.pop(alias)
+                    break
 
     return DebateResult(
         paper=paper,
@@ -315,7 +338,7 @@ if __name__ == "__main__":
     sample_paper = {
         "paper_name": "Scaling Monosemanticity: Extracting Interpretable Features from Claude 3 Sonnet",
         "paper_authors": ["Adly Templeton", "Tom Conerly", "Jonathan Marcus", "Jack Clark"],
-        "summary": (
+        "abstract": (
             "We apply sparse autoencoders to extract interpretable features from "
             "a production-scale language model (Claude 3 Sonnet) and find millions "
             "of features corresponding to a vast range of concepts — cities, people, "
