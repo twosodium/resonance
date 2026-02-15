@@ -30,14 +30,17 @@ from supabase import create_client as _create_client  # noqa: E402
 logger = logging.getLogger("api")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
 
-# Anthropic client for paper chat — lazy init
+# Anthropic client for paper chat — rebuilt whenever the API key changes
 _chat_client = None
+_chat_client_key: str | None = None  # tracks which key the client was built with
 
 def _get_chat_client():
-    global _chat_client
-    if _chat_client is None:
+    global _chat_client, _chat_client_key
+    current_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if _chat_client is None or current_key != _chat_client_key:
         from anthropic import Anthropic
-        _chat_client = Anthropic()
+        _chat_client = Anthropic(api_key=current_key)
+        _chat_client_key = current_key
     return _chat_client
 
 # In-memory paper chat histories: { paper_id: [ {role, content} ] }
