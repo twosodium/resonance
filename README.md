@@ -44,8 +44,9 @@ python research_harness.py "<YOUR_TOPIC>" [OPTIONS]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--paragraph` | — | Treat the prompt as a paragraph: Claude summarizes it to a short research topic, then the harness runs on that topic. |
-| `--candidates N` | 50 | Number of candidates to fetch from **each** source (arXiv, bioRxiv, OpenAlex, Semantic Scholar, internet). |
-| `--top K` | 20 | Number of best papers to return after Claude filter. |
+| `--sources LIST` | all | Comma-separated list of sources to use: `arxiv`, `biorxiv`, `openalex`, `semantic_scholar`, `internet`. Default uses all. Env: **SOURCES**. |
+| `--candidates N` | 50 | Number of candidates to fetch from **each** source per round. |
+| `--top K` | 20 | Number of best papers to return after preprocessing and final Claude filter. |
 | `--max-age-months N` | 0 | Keep only papers from the last N months (0 = no filter). |
 | `--no-supabase` | — | Do not write to Supabase even if env is set. |
 | `--supabase-table NAME` | papers | Supabase table name for upsert. |
@@ -64,6 +65,9 @@ python research_harness.py "single cell RNA" --candidates 30 --top 10
 
 # Only papers from the last 12 months
 python research_harness.py "your topic" --max-age-months 12
+
+# Use only arXiv and OpenAlex (no bioRxiv, Semantic Scholar, or internet)
+python research_harness.py "your topic" --sources arxiv,openalex
 ```
 
 ## Output (JSON)
@@ -83,14 +87,16 @@ Each paper in the JSON array includes:
 
 ## How it works
 
-1. **Accumulate candidates:**  
-   - **arXiv:** API fetch (no filter); each source contributes up to `--candidates` papers.  
-   - **bioRxiv:** Browserbase + Stagehand opens bioRxiv search, extracts relevant papers, then **visits each paper page** to scrape **date, abstract, and full text** so Claude can judge with full metadata.  
-   - **Internet:** Same flow via Google Scholar; for each result we **scrape the article page** for date, abstract, and full text.  
-   Requires **BROWSERBASE_*** and **ANTHROPIC_API_KEY** for bioRxiv and internet; otherwise only arXiv is used.
-2. **Combine** all sources and deduplicate by URL; apply optional **recency** filter and sort by date.
-3. **Single Claude filter:** Anthropic selects the **best `--top` papers** from the combined list (relevance and quality). Set **ANTHROPIC_API_KEY**; optional **FILTER_LLM_MODEL**.
-4. **Return:** The selected papers as JSON. If Supabase is configured, results are written to the table (by `url`).
+1. **Source selection:** Only the sources you enable (via `--sources` or env **SOURCES**) are queried. Options: `arxiv`, `biorxiv`, `openalex`, `semantic_scholar`, `internet`. Default is all.
+2. **Iterative candidate accumulation:**  
+   - **Round 0:** Fetch up to `--candidates` from each enabled source (arXiv, bioRxiv, OpenAlex, Semantic Scholar, internet).  
+   - **Direct-relevance preprocessing:** Claude keeps only papers **directly** about the topic (discards tangentially related ones).  
+   - If the number of directly relevant papers is below `--top`, another round fetches more candidates from API sources (with pagination); bioRxiv and internet are only used in round 0.  
+   - Rounds repeat until there are at least `--top` directly relevant papers or a maximum number of rounds (or no new papers).  
+   - **arXiv / OpenAlex / Semantic Scholar** use pagination (start/page/offset) in later rounds; **bioRxiv** and **internet** run only in the first round.
+3. **Combine** all candidates, deduplicate by URL; apply optional **recency** filter (`--max-age-months`), then the direct-relevance filter above.
+4. **Final Claude filter:** From the directly relevant set, Anthropic selects the **best `--top` papers** (relevance and quality). **ANTHROPIC_API_KEY** required; optional **FILTER_LLM_MODEL**.
+5. **Return:** The selected papers as JSON. If Supabase is configured, results are written to the table (by `url`).
 
 **Supabase:** If **SUPABASE_URL** and **SUPABASE_SERVICE_ROLE_KEY** are set, the script writes each paper to the table (default `papers`). It uses **upsert** when the table has a `UNIQUE` constraint on `url`; otherwise it falls back to **insert** (duplicates possible). Create the table in the Supabase SQL editor, e.g.:
 
